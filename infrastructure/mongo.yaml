@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mongo
+  namespace: database
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongo
+  template:
+    metadata:
+      labels:
+        app: mongo
+    spec:
+      containers:
+        - name: mongo
+          image: mongo:5.0
+          ports:
+            - containerPort: 27017
+          command: ["/usr/bin/mongod"]
+          args: ["--replSet", "rs0", "--bind_ip_all"]
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              value: root
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              value: password123
+          lifecycle:
+            postStart:
+              exec:
+                command:
+                  - /bin/sh
+                  - -c
+                  - |
+                    until mongosh --eval "print(\"waited for connection\")"
+                    do
+                      sleep 2
+                    done
+                    mongosh --eval "rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'mongo-mongodb.database.svc.cluster.local:27017'}]})" || true
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongo-mongodb
+  namespace: database
+spec:
+  selector:
+    app: mongo
+  ports:
+    - protocol: TCP
+      port: 27017
+      targetPort: 27017
