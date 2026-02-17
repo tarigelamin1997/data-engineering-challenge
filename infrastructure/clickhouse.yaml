@@ -1,0 +1,56 @@
+apiVersion: "clickhouse.altinity.com/v1"
+kind: "ClickHouseInstallation"
+metadata:
+  name: "chi-clickhouse"
+  namespace: "database"
+spec:
+  configuration:
+    users:
+      clickhouse_operator:
+        networks:
+          ip: "::/0"
+      default:
+        password: "password123"
+        networks:
+          ip: "::/0"
+        profile: default
+        quota: default
+        access_management: 1
+    profiles:
+      default: {}
+    quotas:
+      default: {}
+    settings: {}
+    files: {}
+    clusters:
+      - name: "my-cluster"
+        layout:
+          shardsCount: 1
+          replicasCount: 1
+  templates:
+    volumeClaimTemplates:
+      - name: storage-vc-template
+        spec:
+          accessModes:
+            - ReadWriteOnce
+          resources:
+            requests:
+              storage: 10Gi
+    podTemplates:
+      - name: clickhouse-pod-template
+        spec:
+          containers:
+            - name: clickhouse
+              image: clickhouse/clickhouse-server:23.8
+              ports:
+                - name: http
+                  containerPort: 8123
+                  hostPort: 8123
+                - name: client
+                  containerPort: 9000
+                - name: interserver
+                  containerPort: 9009
+  defaults:
+    templates:
+      dataVolumeClaimTemplate: storage-vc-template
+      podTemplate: clickhouse-pod-template

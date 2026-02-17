@@ -9,19 +9,37 @@ spec:
   version: 3.7.0
   replicas: 1
   bootstrapServers: my-cluster-kafka-bootstrap:9092
-  image: quay.io/debezium/connect:2.5
+  image: quay.io/debezium/connect:2.7.0.Final
 
   groupId: connect-cluster
   offsetStorageTopic: connect-cluster-offsets
   configStorageTopic: connect-cluster-configs
   statusStorageTopic: connect-cluster-status
 
+  resources:
+    requests:
+      memory: 1Gi
+      cpu: "500m"
+    limits:
+      memory: 2Gi
+      cpu: "1000m"
+
+  readinessProbe:
+    initialDelaySeconds: 300
+    periodSeconds: 10
+  livenessProbe:
+    initialDelaySeconds: 300
+    periodSeconds: 10
+
   config:
     config.storage.replication.factor: 1
     offset.storage.replication.factor: 1
     status.storage.replication.factor: 1
+    key.converter: org.apache.kafka.connect.json.JsonConverter
+    value.converter: org.apache.kafka.connect.json.JsonConverter
+    key.converter.schemas.enable: false
+    value.converter.schemas.enable: false
 
-  # Use template to mount secrets
   template:
     pod:
       volumes:
@@ -33,7 +51,8 @@ spec:
             secretName: mongo-credentials
     connectContainer:
       volumeMounts:
+        # CRITICAL: These must be /mnt/
         - name: postgres-auth
-          mountPath: /opt/kafka/external-configuration/postgres-auth
+          mountPath: /mnt/postgres-auth
         - name: mongo-auth
-          mountPath: /opt/kafka/external-configuration/mongo-auth
+          mountPath: /mnt/mongo-auth

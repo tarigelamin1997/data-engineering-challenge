@@ -1,4 +1,4 @@
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnector
 metadata:
   name: mongo-connector
@@ -9,7 +9,8 @@ spec:
   class: io.debezium.connector.mongodb.MongoDbConnector
   tasksMax: 1
   config:
-    mongodb.connection.string: "mongodb://root:${file:/opt/kafka/external-configuration/mongo-auth/password}@mongo-mongodb.database.svc.cluster.local:27017/?authSource=admin"
+    # CRITICAL: Reading password from the NEW /mnt location
+    mongodb.connection.string: "mongodb://root:${file:/mnt/mongo-auth/password}@mongo-mongodb.database.svc.cluster.local:27017/?authSource=admin"
     topic.prefix: mongo
     collection.include.list: commerce.events
     capture.mode: change_streams_update_full

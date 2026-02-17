@@ -1,4 +1,4 @@
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaConnector
 metadata:
   name: postgres-connector
@@ -10,12 +10,10 @@ spec:
   tasksMax: 1
   config:
     database.hostname: postgres-postgresql.database.svc.cluster.local
-    database.port: "5432"
+    database.port: 5432
     database.user: postgres
-    database.password: "${file:/opt/kafka/external-configuration/postgres-auth/password}"
+    # CRITICAL: Reading password from the NEW /mnt location
+    database.password: "${file:/mnt/postgres-auth/password:password}"
     database.dbname: postgres
-    database.server.name: postgres-server
-    plugin.name: pgoutput
-    table.include.list: public.users
     topic.prefix: postgres
-    publication.autocreate.mode: filtered
+    table.include.list: public.users
