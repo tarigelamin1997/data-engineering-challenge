@@ -1,0 +1,39 @@
+apiVersion: kafka.strimzi.io/v1
+kind: KafkaConnect
+metadata:
+  name: my-connect-cluster
+  namespace: kafka
+  annotations:
+    strimzi.io/use-connector-resources: "true"
+spec:
+  version: 3.7.0
+  replicas: 1
+  bootstrapServers: my-cluster-kafka-bootstrap:9092
+  image: quay.io/debezium/connect:2.5
+
+  groupId: connect-cluster
+  offsetStorageTopic: connect-cluster-offsets
+  configStorageTopic: connect-cluster-configs
+  statusStorageTopic: connect-cluster-status
+
+  config:
+    config.storage.replication.factor: 1
+    offset.storage.replication.factor: 1
+    status.storage.replication.factor: 1
+
+  # Use template to mount secrets
+  template:
+    pod:
+      volumes:
+        - name: postgres-auth
+          secret:
+            secretName: postgres-credentials
+        - name: mongo-auth
+          secret:
+            secretName: mongo-credentials
+    connectContainer:
+      volumeMounts:
+        - name: postgres-auth
+          mountPath: /opt/kafka/external-configuration/postgres-auth
+        - name: mongo-auth
+          mountPath: /opt/kafka/external-configuration/mongo-auth

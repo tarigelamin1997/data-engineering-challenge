@@ -1,4 +1,4 @@
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: KafkaNodePool
 metadata:
   name: my-pool
@@ -13,7 +13,7 @@ spec:
   storage:
     type: ephemeral
 ---
-apiVersion: kafka.strimzi.io/v1beta2
+apiVersion: kafka.strimzi.io/v1
 kind: Kafka
 metadata:
   name: my-cluster
@@ -24,7 +24,6 @@ metadata:
 spec:
   kafka:
     version: 4.0.0
-    metadataVersion: 4.0-IV1
     listeners:
       - name: plain
         port: 9092
