@@ -1,0 +1,20 @@
+# 1. Start with the Strimzi Base (Has the scripts Strimzi needs)
+FROM quay.io/strimzi/kafka:0.40.0-kafka-3.7.0
+
+USER root:root
+
+# 2. Create directory for plugins
+RUN mkdir -p /opt/kafka/plugins/debezium-postgres \
+    && mkdir -p /opt/kafka/plugins/debezium-mongo
+
+# 3. Download Debezium Postgres Connector
+RUN curl -Lo /tmp/debezium-postgres.tar.gz https://repo1.maven.org/maven2/io/debezium/debezium-connector-postgres/2.5.4.Final/debezium-connector-postgres-2.5.4.Final-plugin.tar.gz \
+    && tar -xzf /tmp/debezium-postgres.tar.gz -C /opt/kafka/plugins/debezium-postgres --strip-components=1 \
+    && rm /tmp/debezium-postgres.tar.gz
+
+# 4. Download Debezium Mongo Connector
+RUN curl -Lo /tmp/debezium-mongo.tar.gz https://repo1.maven.org/maven2/io/debezium/debezium-connector-mongodb/2.5.4.Final/debezium-connector-mongodb-2.5.4.Final-plugin.tar.gz \
+    && tar -xzf /tmp/debezium-mongo.tar.gz -C /opt/kafka/plugins/debezium-mongo --strip-components=1 \
+    && rm /tmp/debezium-mongo.tar.gz
+
+USER 1001

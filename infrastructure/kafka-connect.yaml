@@ -9,19 +9,22 @@ spec:
   version: 3.7.0
   replicas: 1
   bootstrapServers: my-cluster-kafka-bootstrap:9092
-  image: quay.io/debezium/connect:2.7.0.Final
+
+  # UPDATED IMAGE
+  image: my-final-connect:1.0
 
   groupId: connect-cluster
   offsetStorageTopic: connect-cluster-offsets
   configStorageTopic: connect-cluster-configs
   statusStorageTopic: connect-cluster-status
 
+  # UPDATED MEMORY (4GB)
   resources:
     requests:
-      memory: 1Gi
+      memory: 2Gi
       cpu: "500m"
     limits:
-      memory: 2Gi
+      memory: 4Gi
       cpu: "1000m"
 
   readinessProbe:
@@ -51,7 +54,6 @@ spec:
             secretName: mongo-credentials
     connectContainer:
       volumeMounts:
-        # CRITICAL: These must be /mnt/
         - name: postgres-auth
           mountPath: /mnt/postgres-auth
         - name: mongo-auth
