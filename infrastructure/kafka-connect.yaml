@@ -6,12 +6,12 @@ metadata:
   annotations:
     strimzi.io/use-connector-resources: "true"
 spec:
-  version: 3.7.0
+  version: 4.0.0
   replicas: 1
   bootstrapServers: my-cluster-kafka-bootstrap:9092
 
-  # UPDATED IMAGE
-  image: my-final-connect:1.0
+  # Custom hybrid image: Strimzi base + Debezium connectors
+  image: my-final-connect:1.1
 
   groupId: connect-cluster
   offsetStorageTopic: connect-cluster-offsets
@@ -42,6 +42,8 @@ spec:
     value.converter: org.apache.kafka.connect.json.JsonConverter
     key.converter.schemas.enable: false
     value.converter.schemas.enable: false
+    # Allow DirectoryConfigProvider to read secret files from /mnt
+    config.providers.strimzidir.param.allowed.paths: /opt/kafka,/mnt
 
   template:
     pod:

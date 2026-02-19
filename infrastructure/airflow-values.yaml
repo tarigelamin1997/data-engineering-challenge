@@ -1,0 +1,95 @@
+# Airflow Helm values for local Kind deployment
+# Chart: apache-airflow/airflow
+# Executor: LocalExecutor (no Redis/Celery overhead for a single-node Kind cluster)
+
+executor: LocalExecutor
+
+# Minimal resource requests so Kind doesn't OOM
+scheduler:
+  resources:
+    requests:
+      cpu: "200m"
+      memory: "512Mi"
+    limits:
+      cpu: "500m"
+      memory: "1Gi"
+
+webserver:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+    limits:
+      cpu: "400m"
+      memory: "512Mi"
+  # Expose Airflow UI via NodePort mapped to host port 8080 in kind-config.yaml
+  service:
+    type: NodePort
+    ports:
+      - name: airflow-ui
+        port: 8080
+        targetPort: 8080
+        nodePort: 30000
+  # Create an admin user on first boot
+  defaultUser:
+    enabled: true
+    role: Admin
+    username: admin
+    email: admin@airflow.local
+    firstName: Admin
+    lastName: User
+    password: admin
+
+triggerer:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+
+# Disable unused components
+flower:
+  enabled: false
+
+redis:
+  enabled: false
+
+statsd:
+  enabled: false
+
+# DAGs: mount from ConfigMap (airflow-dags, created separately)
+# This avoids needing gitSync or a PVC.
+dags:
+  gitSync:
+    enabled: false
+  persistence:
+    enabled: false
+
+# Mount the DAG ConfigMap into scheduler, webserver, and worker/triggerer
+extraVolumes:
+  - name: dag-files
+    configMap:
+      name: airflow-dags
+
+extraVolumeMounts:
+  - name: dag-files
+    mountPath: /opt/airflow/dags
+
+# Bundled PostgreSQL for Airflow's metadata database
+postgresql:
+  enabled: true
+  primary:
+    resources:
+      requests:
+        cpu: "100m"
+        memory: "256Mi"
+
+# Logging: use local (stdout) — no S3/GCS needed
+logs:
+  persistence:
+    enabled: false
+
+# Fernet key for encrypting DB connections (fixed value for reproducibility)
+fernetKey: "YlCImzjge_TeZc7VdbRYIGOjTZ-RNMj9OYGMFTa4qyE="
+
+# Secret key for the webserver (fixed for reproducibility)
+webserverSecretKey: "a8d3f7c2b1e4958067a3b2c1d4e5f678"

@@ -9,8 +9,8 @@ spec:
   class: io.debezium.connector.mongodb.MongoDbConnector
   tasksMax: 1
   config:
-    # CRITICAL: Reading password from the NEW /mnt location
-    mongodb.connection.string: "mongodb://root:${file:/mnt/mongo-auth/password}@mongo-mongodb.database.svc.cluster.local:27017/?authSource=admin"
+    # DirectoryConfigProvider reads the file named 'password' from the directory
+    mongodb.connection.string: "mongodb://root:${strimzidir:/mnt/mongo-auth:password}@mongo-mongodb.database.svc.cluster.local:27017/?authSource=admin&replicaSet=rs0"
     topic.prefix: mongo
     collection.include.list: commerce.events
     capture.mode: change_streams_update_full

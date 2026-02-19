@@ -12,8 +12,9 @@ spec:
     database.hostname: postgres-postgresql.database.svc.cluster.local
     database.port: 5432
     database.user: postgres
-    # CRITICAL: Reading password from the NEW /mnt location
-    database.password: "${file:/mnt/postgres-auth/password:password}"
+    # DirectoryConfigProvider reads the file named 'password' from the directory
+    database.password: "${strimzidir:/mnt/postgres-auth:password}"
     database.dbname: postgres
     topic.prefix: postgres
     table.include.list: public.users
+    plugin.name: pgoutput
