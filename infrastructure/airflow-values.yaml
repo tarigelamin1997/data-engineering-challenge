@@ -1,5 +1,5 @@
 # Airflow Helm values for local Kind deployment
-# Chart: apache-airflow/airflow
+# Chart: apache-airflow/airflow (Airflow 3.x)
 # Executor: LocalExecutor (no Redis/Celery overhead for a single-node Kind cluster)
 
 executor: LocalExecutor
@@ -14,7 +14,8 @@ scheduler:
       cpu: "500m"
       memory: "1Gi"
 
-webserver:
+# Airflow 3.x uses apiServer instead of webserver for the UI
+apiServer:
   resources:
     requests:
       cpu: "100m"
@@ -22,7 +23,6 @@ webserver:
     limits:
       cpu: "400m"
       memory: "512Mi"
-  # Expose Airflow UI via NodePort mapped to host port 8080 in kind-config.yaml
   service:
     type: NodePort
     ports:
@@ -30,7 +30,14 @@ webserver:
         port: 8080
         targetPort: 8080
         nodePort: 30000
-  # Create an admin user on first boot
+
+# Create default admin user
+createUserJob:
+  useHelmHooks: false
+  applyCustomEnv: false
+
+webserver:
+  # Kept for compatibility; Airflow 3.x uses apiServer above
   defaultUser:
     enabled: true
     role: Admin
@@ -41,6 +48,12 @@ webserver:
     password: admin
 
 triggerer:
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "256Mi"
+
+dagProcessor:
   resources:
     requests:
       cpu: "100m"
@@ -57,26 +70,30 @@ statsd:
   enabled: false
 
 # DAGs: mount from ConfigMap (airflow-dags, created separately)
-# This avoids needing gitSync or a PVC.
 dags:
   gitSync:
     enabled: false
   persistence:
     enabled: false
 
-# Mount the DAG ConfigMap into scheduler, webserver, and worker/triggerer
-extraVolumes:
+# Global volumes applied to ALL Airflow pods (scheduler, api-server, etc.)
+# Use subPath to avoid the ConfigMap symlink directory structure that causes
+# Airflow's DAG walker to raise a "recursive loop" error.
+volumes:
   - name: dag-files
     configMap:
       name: airflow-dags
 
-extraVolumeMounts:
+volumeMounts:
   - name: dag-files
-    mountPath: /opt/airflow/dags
+    mountPath: /opt/airflow/dags/gold_user_activity.py
+    subPath: gold_user_activity.py
 
 # Bundled PostgreSQL for Airflow's metadata database
 postgresql:
   enabled: true
+  image:
+    tag: latest
   primary:
     resources:
       requests:

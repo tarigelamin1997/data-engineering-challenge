@@ -4,7 +4,7 @@ gold_user_activity DAG — Phase 4 Gold Layer
 Runs daily. Aggregates events per user per day from the ClickHouse silver
 layer and writes summarized rows into gold_user_activity.
 
-Schedule: @daily (runs at midnight UTC, processes the previous calendar day)
+Schedule: @daily (runs at midnight UTC, processes the current calendar day)
 Idempotent: re-running for the same date inserts new rows with a newer
             _updated_at; querying with FINAL returns only the latest version.
 
@@ -18,12 +18,12 @@ from datetime import datetime, timedelta
 
 import requests
 from airflow import DAG
-from airflow.operators.python import PythonOperator
+from airflow.providers.standard.operators.python import PythonOperator
 
 CLICKHOUSE_URL = (
     "http://chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local:8123/"
 )
-CLICKHOUSE_AUTH = {"user": "default", "password": ""}
+CLICKHOUSE_AUTH = {"user": "airflow", "password": "airflow123"}
 
 
 def _run_ch_query(query: str) -> str:

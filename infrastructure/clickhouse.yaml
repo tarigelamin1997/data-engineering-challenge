@@ -16,12 +16,35 @@ spec:
         profile: default
         quota: default
         access_management: 1
+      # Dedicated user for Airflow — unrestricted network access so pods in
+      # other namespaces (airflow/) can connect to ClickHouse.
+      airflow/password: "airflow123"
+      airflow/profile: "default"
+      airflow/quota: "default"
+      airflow/networks/ip/0: "0.0.0.0/0"
+      airflow/networks/ip/1: "::/0"
     profiles:
       default: {}
     quotas:
       default: {}
-    settings: {}
-    files: {}
+    settings:
+      # Enable SQL-based user management (stores users in /var/lib/clickhouse/access/)
+      access_control_path: /var/lib/clickhouse/access/
+    files:
+      # Override the operator-generated network restrictions for the airflow user.
+      # This file is loaded AFTER chop-generated-users.xml (z-prefix sorts last).
+      # Using replace="1" on <networks> so it replaces instead of merging.
+      "users.d/zzz-airflow-access.xml": |
+        <clickhouse>
+          <users>
+            <airflow>
+              <networks replace="1">
+                <ip>0.0.0.0/0</ip>
+                <ip>::/0</ip>
+              </networks>
+            </airflow>
+          </users>
+        </clickhouse>
     clusters:
       - name: "my-cluster"
         layout:
