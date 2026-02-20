@@ -17,23 +17,23 @@ MongoDB (events)    ──┘                                         (Silver)  
 | Layer | Technology |
 |---|---|
 | Platform | [Kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker) |
-| Streaming | [Strimzi](https://strimzi.io/) (Kafka KRaft) + [Debezium](https://debezium.io/) (CDC) |
-| Analytics | [ClickHouse](https://clickhouse.com/) via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
-| Orchestration | [Apache Airflow](https://airflow.apache.org/) |
+| Streaming | [Strimzi](https://strimzi.io/) (Kafka 4.0.0, KRaft) + [Debezium](https://debezium.io/) 2.7.0 (CDC) |
+| Analytics | [ClickHouse](https://clickhouse.com/) 23.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
+| Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.0.2 |
 
 ## Prerequisites
 
 - [Docker Desktop](https://www.docker.com/products/docker-desktop/)
 - `kubectl`
-- `kind` (bundled in `./bin/kind.exe`)
-- `helm` (bundled in `./bin/helm.exe`)
+- `kind` (or use the bundled `./bin/kind.exe`)
+- `helm` (or use the bundled `./bin/helm.exe`)
 
 ## Quick Start
 
 ### 1. Create the Kind Cluster
 
 ```bash
-./bin/kind.exe create cluster --config kind-config.yaml --name data-engineering-challenge
+kind create cluster --config infrastructure/kind-config.yaml --name data-engineering-challenge
 ```
 
 ### 2. Install Strimzi Operator
@@ -55,7 +55,7 @@ kubectl wait kafka/my-cluster -n kafka --for=condition=Ready --timeout=300s
 
 ```bash
 docker build -f infrastructure/Dockerfile.final -t my-final-connect:1.1 .
-./bin/kind.exe load docker-image my-final-connect:1.1 --name data-engineering-challenge
+kind load docker-image my-final-connect:1.1 --name data-engineering-challenge
 ```
 
 ### 5. Deploy Databases and Kafka Connect
@@ -96,12 +96,41 @@ kubectl exec -n database $MONGO_POD -- \
   --file scripts/seed_mongo.js
 ```
 
+### 7. Deploy ClickHouse
+
+```bash
+kubectl apply -f https://raw.githubusercontent.com/Altinity/clickhouse-operator/master/deploy/operator/clickhouse-operator-install-bundle.yaml
+kubectl apply -f infrastructure/clickhouse.yaml
+kubectl wait pod -n database -l clickhouse.altinity.com/chi=chi-clickhouse --for=condition=Ready --timeout=120s
+```
+
+Create the schema:
+
+```bash
+kubectl exec -i -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" --multiquery < scripts/create_tables.sql
+kubectl exec -i -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" --multiquery < scripts/create_gold.sql
+```
+
+### 8. Deploy Airflow
+
+```bash
+kubectl create namespace airflow
+kubectl create configmap airflow-dags -n airflow --from-file=dags/gold_user_activity.py
+helm install airflow apache-airflow/airflow \
+  --namespace airflow \
+  --values infrastructure/airflow-values.yaml \
+  --timeout 10m
+```
+
 ## Verification
 
 ```bash
 # All pods running
 kubectl get pods -n kafka
 kubectl get pods -n database
+kubectl get pods -n airflow
 
 # Both CDC connectors READY=True
 kubectl get kafkaconnector -n kafka
@@ -110,10 +139,15 @@ kubectl get kafkaconnector -n kafka
 kubectl exec -n kafka my-cluster-my-pool-0 -- \
   /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list
 
-kubectl exec -n kafka my-cluster-my-pool-0 -- \
-  /opt/kafka/bin/kafka-console-consumer.sh \
-  --bootstrap-server localhost:9092 \
-  --topic postgres.public.users --from-beginning --max-messages 4 --timeout-ms 10000
+# ClickHouse silver tables have data
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT count() FROM users_silver; SELECT count() FROM events_silver;"
+
+# Gold table (after DAG run)
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT * FROM gold_user_activity FINAL ORDER BY user_id, event_type"
 ```
 
 ## Repository Structure
@@ -121,37 +155,54 @@ kubectl exec -n kafka my-cluster-my-pool-0 -- \
 ```
 .
 ├── infrastructure/
-│   ├── Dockerfile.final          # Hybrid Connect image (Strimzi base + Debezium plugins)
-│   ├── kraft-cluster.yaml        # Kafka cluster (KRaft, version 4.0.0)
-│   ├── kafka-connect.yaml        # Kafka Connect CR
-│   ├── postgres-connector.yaml   # Debezium PostgreSQL connector
-│   ├── mongo-connector.yaml      # Debezium MongoDB connector
-│   ├── postgres.yaml             # PostgreSQL 13 Deployment + Service
-│   ├── mongo.yaml                # MongoDB 5.0 Deployment + Service (ReplicaSet)
-│   ├── secrets.yaml              # DB credentials (Kubernetes Secrets)
-│   └── clickhouse.yaml           # ClickHouse cluster (Altinity)
+│   ├── kind-config.yaml            # Kind cluster definition with port mappings
+│   ├── Dockerfile.final            # Hybrid Connect image (Strimzi base + Debezium plugins)
+│   ├── kraft-cluster.yaml          # Kafka cluster (KRaft, version 4.0.0)
+│   ├── kafka-connect.yaml          # Kafka Connect CR
+│   ├── postgres-connector.yaml     # Debezium PostgreSQL connector
+│   ├── mongo-connector.yaml        # Debezium MongoDB connector
+│   ├── postgres.yaml               # PostgreSQL 13 Deployment + Service
+│   ├── mongo.yaml                  # MongoDB 5.0 Deployment + Service (ReplicaSet)
+│   ├── secrets.yaml                # DB credentials (Kubernetes Secrets)
+│   ├── clickhouse.yaml             # ClickHouse cluster (Altinity CHI)
+│   └── airflow-values.yaml         # Airflow Helm chart values
 ├── scripts/
-│   ├── seed_postgres.sql         # Creates and seeds the users table
-│   ├── seed_mongo.js             # Seeds the commerce.events collection
-│   ├── create_bronze.sql         # ClickHouse Kafka engine tables
-│   ├── create_silver.sql         # ClickHouse silver layer tables + MVs
-│   └── create_tables.sql         # Combined ClickHouse schema
-├── dags/                         # Airflow DAGs
+│   ├── seed_postgres.sql           # Creates and seeds the users table
+│   ├── seed_mongo.js               # Seeds the commerce.events collection
+│   ├── create_tables.sql           # ClickHouse bronze + silver schema
+│   ├── create_gold.sql             # ClickHouse gold table
+│   ├── create_bronze.sql           # ClickHouse Kafka engine tables (standalone)
+│   └── create_silver.sql           # ClickHouse silver layer (standalone)
+├── dags/
+│   └── gold_user_activity.py       # Airflow DAG — daily gold aggregation
 ├── docs/
-│   └── phase3-cdc-pipeline.md   # Phase 3 deep-dive: architecture, issues, fixes
-├── kind-config.yaml
+│   ├── phase1-environment-setup.md # Phase 1: Kind, Strimzi, databases
+│   ├── phase2-kafka-cluster.md     # Phase 2: Kafka KRaft + Connect image
+│   ├── phase3-cdc-pipeline.md      # Phase 3: Debezium connectors + CDC
+│   ├── phase4-gold-layer.md        # Phase 4: ClickHouse + Airflow
+│   ├── how-to-test-and-operate.md  # Operations manual and troubleshooting
+│   ├── 01-Logical-Data-Flow-Architecture.png
+│   ├── 02-Physical-Kubernetes-Architecture-Self-Hosted.png
+│   └── 03-Physical-AWS-Cloud-Native-Architecture-Managed.png
+├── logs/                           # Debug logs and diagnostic dumps
 └── README.md
 ```
 
 ## Documentation
 
-- [Phase 3 — CDC Pipeline](docs/phase3-cdc-pipeline.md): Architecture decisions, deployment steps, and every issue encountered with root cause analysis and fixes.
+| Document | Description |
+|---|---|
+| [Phase 1 — Environment Setup](docs/phase1-environment-setup.md) | Kind cluster, Strimzi operator, database deployments, seed data |
+| [Phase 2 — Kafka Cluster](docs/phase2-kafka-cluster.md) | Kafka KRaft, custom Connect image, internal topics, secret injection |
+| [Phase 3 — CDC Pipeline](docs/phase3-cdc-pipeline.md) | Debezium connectors, CDC message format, connector troubleshooting |
+| [Phase 4 — Gold Layer](docs/phase4-gold-layer.md) | ClickHouse schema, Airflow DAG, gold aggregation |
+| [How to Test and Operate](docs/how-to-test-and-operate.md) | Full operations manual: health checks, testing, recovery, troubleshooting |
 
 ## Status
 
 | Phase | Description | Status |
 |---|---|---|
 | 1 | Environment setup (Kind, Strimzi, databases) | Done |
-| 2 | Kafka cluster (KRaft mode) | Done |
+| 2 | Kafka cluster (KRaft mode) + Connect image | Done |
 | 3 | CDC pipeline (Kafka Connect + Debezium) | Done |
-| 4 | ClickHouse ingestion + Airflow DAG | In Progress |
+| 4 | ClickHouse ingestion + Airflow gold DAG | Done |

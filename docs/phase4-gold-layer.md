@@ -27,7 +27,7 @@ Kafka Topics
 |---|---|---|---|
 | Altinity ClickHouse Operator | Deployment | kube-system | v0.24.x — manages ClickHouseInstallation CRs |
 | ClickHouse cluster | ClickHouseInstallation | database | 1 shard / 1 replica, image `clickhouse/clickhouse-server:23.8` |
-| Apache Airflow | Helm release `airflow` | airflow | Airflow 3.1.7, LocalExecutor, bundled PostgreSQL |
+| Apache Airflow | Helm release `airflow` (chart 1.18.0) | airflow | Airflow 3.0.2, LocalExecutor, bundled PostgreSQL |
 
 ---
 
@@ -89,9 +89,21 @@ ORDER BY (date, user_id, event_type);
 
 ---
 
+## Key Files
+
+| File | Purpose |
+|---|---|
+| [infrastructure/clickhouse.yaml](../infrastructure/clickhouse.yaml) | ClickHouseInstallation CR — users, networking, storage |
+| [infrastructure/airflow-values.yaml](../infrastructure/airflow-values.yaml) | Airflow Helm chart values — executor, DAG mount, resources |
+| [scripts/create_tables.sql](../scripts/create_tables.sql) | Bronze + Silver schema (Kafka engine, MVs, silver tables) |
+| [scripts/create_gold.sql](../scripts/create_gold.sql) | Gold table definition |
+| [dags/gold_user_activity.py](../dags/gold_user_activity.py) | Airflow DAG — daily aggregation |
+
+---
+
 ## Airflow DAG: `gold_user_activity`
 
-**File**: `dags/gold_user_activity.py`
+**File**: [dags/gold_user_activity.py](../dags/gold_user_activity.py)
 
 | Property | Value |
 |---|---|
@@ -158,7 +170,12 @@ kubectl exec -n kafka my-cluster-my-pool-0 -- bash -c \
 Mounting an entire ConfigMap directory creates Kubernetes symlinks (`..XXXX` hidden directories) that Airflow's file walker treats as recursive loops. Fix: use `subPath` to mount each file individually — this bypasses the symlink structure and mounts the file directly.
 
 ```yaml
-extraVolumeMounts:
+# Global volumes/volumeMounts in airflow-values.yaml
+volumes:
+  - name: dag-files
+    configMap:
+      name: airflow-dags
+volumeMounts:
   - name: dag-files
     mountPath: /opt/airflow/dags/gold_user_activity.py
     subPath: gold_user_activity.py
@@ -185,6 +202,12 @@ Import from `airflow.providers.standard.operators.python` instead:
 ```python
 from airflow.providers.standard.operators.python import PythonOperator
 ```
+
+### 6. ClickHouse 23.8 Kafka Engine incompatible with Kafka 4.0.0
+
+ClickHouse 23.8 bundles librdkafka ~2.0.x (from 2023) which returns `ERR__NOT_IMPLEMENTED` (-1001) for every message polled from Kafka 4.0.0. The Kafka engine tables (`users_queue`, `events_queue`) and their materialized views cannot consume data automatically.
+
+**Workaround**: Populate silver tables manually via `INSERT INTO ... VALUES` or by running the gold DAG which queries already-populated silver tables. A permanent fix requires upgrading ClickHouse to 24.x+ which ships a compatible librdkafka.
 
 ---
 

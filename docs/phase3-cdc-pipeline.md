@@ -94,7 +94,7 @@ kubectl get pods -n database
 
 ### 4. Initialize MongoDB Replica Set
 
-The Debezium MongoDB connector requires a replica set. Initialize it after the pod is running:
+The Debezium MongoDB connector requires a replica set. The `mongo.yaml` includes a `postStart` lifecycle hook that attempts auto-initialization. If it fails (common on first boot), initialize manually:
 
 ```bash
 MONGO_POD=$(kubectl get pod -n database -l app=mongo -o jsonpath='{.items[0].metadata.name}')
@@ -107,6 +107,8 @@ kubectl exec -n database $MONGO_POD -- mongosh --eval \
 kubectl exec -n database $MONGO_POD -- mongosh --eval \
   "db.getSiblingDB('admin').createUser({user: 'root', pwd: 'password123', roles: [{role: 'root', db: 'admin'}]})"
 ```
+
+> **Note**: If `rs.initiate()` with service DNS fails ("No host described maps to this node"), use `rs.initiate()` without arguments first, then reconfigure with the pod IP. See Phase 1 doc for details.
 
 ### 5. Seed the Databases
 
