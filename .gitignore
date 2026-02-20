@@ -30,3 +30,6 @@ Data-engineering-role-challenge-due-march-1st.pdf
 # --- Large binary files ---
 *.tar
 *.tar.gz
+
+# --- Binaries ---
+bin/

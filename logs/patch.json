@@ -1,0 +1,18 @@
+{
+    "spec": {
+        "template": {
+            "spec": {
+                "containers": [
+                    {
+                        "name": "my-connect-cluster-connect",
+                        "command": [
+                            "/bin/sh",
+                            "-c",
+                            "sleep 3600"
+                        ]
+                    }
+                ]
+            }
+        }
+    }
+}
