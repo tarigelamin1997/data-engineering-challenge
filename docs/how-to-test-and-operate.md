@@ -16,6 +16,7 @@ This guide explains everything about how the CDC data pipeline works and how to 
 8. [Working with Kafka Connect and Debezium](#8-working-with-kafka-connect-and-debezium)
 9. [Testing the CDC Pipeline End-to-End](#9-testing-the-cdc-pipeline-end-to-end)
 10. [Working with ClickHouse](#10-working-with-clickhouse)
+10.5. [Working with Airflow](#105-working-with-airflow)
 11. [Common Operational Tasks](#11-common-operational-tasks)
 12. [Troubleshooting Guide](#12-troubleshooting-guide)
 
@@ -29,12 +30,13 @@ The pipeline runs entirely inside a single-node Kind cluster (Docker container a
 
 | Namespace | What Lives There |
 |---|---|
-| `kafka` | Strimzi operator, Kafka broker, Kafka Connect, credential Secrets |
-| `database` | PostgreSQL, MongoDB, ClickHouse |
+| `kafka` | Strimzi operator, Kafka broker (KRaft), Kafka Connect, CDC connectors, credential Secrets |
+| `database` | PostgreSQL 13, MongoDB 5.0, ClickHouse 24.8 |
+| `airflow` | Airflow 3.0.2 (scheduler, dag-processor, triggerer, api-server, bundled PostgreSQL) |
 
 ### Port Mappings (Host → Cluster)
 
-The `kind-config.yaml` exposes these ports directly on your machine:
+The `infrastructure/kind-config.yaml` exposes these ports directly on your machine:
 
 | Host Port | Goes To | Service |
 |---|---|---|
@@ -50,20 +52,23 @@ Kafka and MongoDB are only accessible from inside the cluster (via `kubectl exec
 |---|---|---|---|---|
 | Kafka Broker | `my-cluster-my-pool-0` | `kafka` | `my-cluster-kafka-bootstrap.kafka.svc:9092` | 9092 |
 | Kafka Connect | `my-connect-cluster-connect-0` | `kafka` | `my-connect-cluster-connect-svc.kafka.svc:8083` | 8083 |
-| PostgreSQL | `postgres-postgresql` | `database` | `postgres-postgresql.database.svc:5432` | 5432 |
-| MongoDB | `mongo-mongodb` | `database` | `mongo-mongodb.database.svc:27017` | 27017 |
-| ClickHouse HTTP | `chi-clickhouse-my-cluster-0-0` | `database` | — | 8123 |
-| ClickHouse Native | — | `database` | — | 9000 |
+| PostgreSQL | `postgres-...` | `database` | `postgres-postgresql.database.svc:5432` | 5432 |
+| MongoDB | `mongo-...` | `database` | `mongo-mongodb.database.svc:27017` | 27017 |
+| ClickHouse HTTP | `chi-chi-clickhouse-my-cluster-0-0-0` | `database` | `chi-chi-clickhouse-my-cluster-0-0.database.svc:8123` | 8123 |
+| ClickHouse Native | `chi-chi-clickhouse-my-cluster-0-0-0` | `database` | `chi-chi-clickhouse-my-cluster-0-0.database.svc:9000` | 9000 |
+| Airflow Scheduler | `airflow-scheduler-0` | `airflow` | — | — |
+| Airflow DAG Processor | `airflow-dag-processor-...` | `airflow` | — | — |
 
 ### Credentials
 
-| Service | Username | Password |
-|---|---|---|
-| PostgreSQL | `postgres` | `password123` |
-| MongoDB | `root` | `password123` |
-| ClickHouse | `default` | `password123` |
+| Service | Username | Password | Notes |
+|---|---|---|---|
+| PostgreSQL | `postgres` | `password123` | |
+| MongoDB | `root` | `password123` | Ephemeral — must be recreated after pod restart |
+| ClickHouse (local) | `default` | *(empty)* | Only accessible from ClickHouse pod IPs + loopback |
+| ClickHouse (remote) | `airflow` | `airflow123` | Accessible from any namespace (used by Airflow DAG) |
 
-These passwords are stored in Kubernetes Secrets (`postgres-credentials`, `mongo-credentials`) in the `kafka` namespace, and hardcoded in the ClickHouse CR for now. Do not use these credentials in a production environment.
+Database passwords for Debezium connectors are stored in Kubernetes Secrets (`postgres-credentials`, `mongo-credentials`) in the `kafka` namespace and mounted into the Connect pod at `/mnt/`. The ClickHouse `airflow` user is defined in `infrastructure/clickhouse.yaml`. Do not use these credentials in a production environment.
 
 ---
 
@@ -95,10 +100,10 @@ You cannot "stop" individual Kubernetes pods long-term without deleting their co
 
 ```bash
 # Delete
-./bin/kind.exe delete cluster --name data-engineering-challenge
+kind delete cluster --name data-engineering-challenge
 
 # Recreate from scratch
-./bin/kind.exe create cluster --config kind-config.yaml --name data-engineering-challenge
+kind create cluster --config infrastructure/kind-config.yaml --name data-engineering-challenge
 ```
 
 After recreating, you must redo the full deployment sequence (install Strimzi, deploy Kafka, build/load the Connect image, deploy databases, etc.).
@@ -121,11 +126,12 @@ kubectl config use-context kind-data-engineering-challenge
 
 Run these commands in order. If anything is not `Running` or `Ready`, see [Section 12 — Troubleshooting](#12-troubleshooting-guide).
 
-### Step 1 — Check All Pods in Both Namespaces
+### Step 1 — Check All Pods in All Namespaces
 
 ```bash
 kubectl get pods -n kafka
 kubectl get pods -n database
+kubectl get pods -n airflow
 ```
 
 **Expected `kafka` namespace output**:
@@ -139,12 +145,24 @@ strimzi-cluster-operator-...                 1/1     Running   0
 
 **Expected `database` namespace output**:
 ```
-NAME                        READY   STATUS    RESTARTS
-mongo-...                   1/1     Running   0
-postgres-...                1/1     Running   0
+NAME                                      READY   STATUS    RESTARTS
+chi-chi-clickhouse-my-cluster-0-0-0       1/1     Running   0
+mongo-...                                 1/1     Running   0
+postgres-...                              1/1     Running   0
+```
+
+**Expected `airflow` namespace output**:
+```
+NAME                                     READY   STATUS    RESTARTS
+airflow-dag-processor-...                2/2     Running   0
+airflow-postgresql-0                     1/1     Running   0
+airflow-scheduler-0                      2/2     Running   0
+airflow-triggerer-0                      2/2     Running   0
 ```
 
 > **Kafka Connect note**: The readiness probe has a 300-second (5-minute) initial delay. The pod will show `0/1 Running` for up to 5 minutes after starting before it becomes `1/1 Running`. This is normal — Connect IS running, it's just not yet marked Ready by Kubernetes.
+
+> **Airflow api-server note**: The `airflow-api-server` pod may be in `CrashLoopBackOff` due to CPU starvation on a single Kind node. This does not affect DAG execution — the scheduler and dag-processor handle all task execution. The api-server is only needed for the Airflow web UI.
 
 ### Step 2 — Check Kafka Connect Cluster
 
@@ -194,23 +212,45 @@ The last two (`mongo.commerce.events` and `postgres.public.users`) are the CDC d
 
 ### Step 5 — Verify Data Is in the CDC Topics
 
-```bash
-# Count messages in postgres topic
-kubectl exec -n kafka my-cluster-my-pool-0 -- \
-  /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell \
-  --broker-list localhost:9092 \
-  --topic postgres.public.users \
-  --time -1
+> **Note**: `kafka.tools.GetOffsetShell` was removed in Kafka 4.0.0. Use `kafka-console-consumer.sh` with `--max-messages` to verify messages exist.
 
-# Count messages in mongo topic
+```bash
+# Verify postgres topic has messages (reads up to 4, times out after 10s)
 kubectl exec -n kafka my-cluster-my-pool-0 -- \
-  /opt/kafka/bin/kafka-run-class.sh kafka.tools.GetOffsetShell \
-  --broker-list localhost:9092 \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
+  --topic postgres.public.users \
+  --from-beginning --max-messages 4 --timeout-ms 10000 2>/dev/null | wc -l
+
+# Verify mongo topic has messages (reads up to 5, times out after 10s)
+kubectl exec -n kafka my-cluster-my-pool-0 -- \
+  /opt/kafka/bin/kafka-console-consumer.sh \
+  --bootstrap-server localhost:9092 \
   --topic mongo.commerce.events \
-  --time -1
+  --from-beginning --max-messages 5 --timeout-ms 10000 2>/dev/null | wc -l
 ```
 
-The output shows `<topic>:<partition>:<offset>`. The offset number is how many messages have been produced. After initial seeding, expect at least 4 in postgres (4 users) and 5 in mongo (5 events).
+After initial seeding, expect at least 4 messages in postgres (4 users) and 5 in mongo (5 events).
+
+### Step 6 — Verify ClickHouse Silver Tables
+
+```bash
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT 'users:', count() FROM users_silver UNION ALL SELECT 'events:', count() FROM events_silver"
+```
+
+Expected: `users: 4`, `events: 5`
+
+### Step 7 — Verify Gold Table (After DAG Run)
+
+```bash
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT date, user_id, full_name, total_events, last_event_at FROM gold_user_activity FINAL ORDER BY user_id"
+```
+
+Expected: One row per user per day with their total event count and last event timestamp.
 
 ---
 
@@ -398,10 +438,12 @@ use commerce
 db.events.insertOne({
   user_id: 4,
   event_type: "purchase",
-  timestamp: new Date(),
+  ts: new Date(),
   metadata: { item_id: "C300", amount: 49.99 }
 })
 ```
+
+> **Important**: The field name is `ts` (not `timestamp`). The ClickHouse materialized view `mv_events` extracts this field using `JSONExtractRaw(after, 'ts')`. Using a different field name will result in a `1970-01-01` timestamp in `events_silver`.
 
 This appears in the `mongo.commerce.events` Kafka topic as an `"op": "c"` event.
 
@@ -769,7 +811,7 @@ kubectl exec -n kafka my-cluster-my-pool-0 -- \
 MONGO_POD=$(kubectl get pod -n database -l app=mongo -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n database $MONGO_POD -- \
   mongosh "mongodb://root:password123@localhost:27017/?authSource=admin" \
-  --eval "db.getSiblingDB('commerce').events.insertOne({user_id: 99, event_type: 'test_event', timestamp: new Date()})"
+  --eval "db.getSiblingDB('commerce').events.insertOne({user_id: 99, event_type: 'test_event', ts: new Date(), metadata: {source: 'test'}})"
 ```
 
 **Expected result in Terminal 1** (within ~1-2 seconds):
@@ -803,33 +845,25 @@ kubectl exec -n database $POSTGRES_POD -- psql -U postgres -c \
 
 ## 10. Working with ClickHouse
 
-> **Note**: ClickHouse (Phase 4) may not be deployed yet. This section covers how to use it once deployed.
-
-### Checking ClickHouse Is Deployed
-
-```bash
-kubectl get pods -n database | grep clickhouse
-```
-
 ### Connecting to ClickHouse
 
-ClickHouse HTTP API is accessible on host port 8123 (mapped in `kind-config.yaml`):
-
+From inside the cluster (most reliable):
 ```bash
-# Test the connection
-curl http://localhost:8123/ping
-# Expected: Ok.
-
-# Run a query via HTTP
-curl "http://localhost:8123/?user=default&password=password123" \
-  --data "SELECT version()"
+kubectl exec -it -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password ""
 ```
 
-Or from inside the cluster:
+Via HTTP (from inside or outside the cluster if port-forwarded):
 ```bash
-CH_POD=$(kubectl get pod -n database -l app=clickhouse -o jsonpath='{.items[0].metadata.name}')
-kubectl exec -it -n database $CH_POD -- clickhouse-client --password password123
+# Port-forward if needed
+kubectl port-forward -n database svc/clickhouse-chi-chi-clickhouse-my-cluster-0-0 8123:8123 &
+
+# Test
+curl "http://localhost:8123/?user=default&password=" --data "SELECT version()"
+# Expected: 24.8.x.x
 ```
+
+> **Note**: The `default` user has an **empty password** (not `password123`). For cross-namespace access (e.g., from Airflow), use the `airflow` user with password `airflow123`.
 
 ### Viewing Tables
 
@@ -844,6 +878,7 @@ Expected tables after schema deployment:
 - `events_queue` — Kafka engine (Bronze layer, reads from `mongo.commerce.events`)
 - `events_silver` — MergeTree (Silver layer, raw events)
 - `mv_events` — Materialized View (auto-populates `events_silver`)
+- `gold_user_activity` — ReplacingMergeTree (Gold layer, daily per-user aggregation — populated by Airflow DAG)
 
 ### Querying Silver Tables
 
@@ -879,6 +914,79 @@ SELECT * FROM users_queue LIMIT 5;
 ```
 
 > **Warning**: Querying a Kafka Engine table directly consumes messages from the topic and advances the consumer group offset. Those messages will NOT be processed by the Materialized View. Use this for debugging only.
+
+### Querying the Gold Table
+
+```sql
+-- Daily user activity summary (one row per user per day)
+SELECT date, user_id, full_name, total_events, last_event_at
+FROM gold_user_activity FINAL
+ORDER BY user_id;
+```
+
+### How the Bronze → Silver → Gold Pipeline Works
+
+1. **Bronze**: `users_queue` / `events_queue` (Kafka Engine) auto-consume raw CDC JSON from Kafka topics
+2. **Silver**: Materialized Views (`mv_users`, `mv_events`) parse the Debezium JSON and write into `users_silver` (ReplacingMergeTree) and `events_silver` (MergeTree)
+3. **Gold**: The Airflow DAG `gold_user_activity` runs daily, joins silver tables, and writes aggregated results into `gold_user_activity` (ReplacingMergeTree)
+
+---
+
+## 10.5. Working with Airflow
+
+### Checking Airflow Pods
+
+```bash
+kubectl get pods -n airflow
+```
+
+The scheduler and dag-processor are the critical components. The api-server (web UI) may crash due to CPU constraints on a single Kind node — this does not affect DAG execution.
+
+### Testing the Gold DAG Manually
+
+```bash
+# Run the DAG for a specific date (e.g., today)
+kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
+  bash -c "airflow tasks test gold_user_activity compute_gold_user_activity 2026-02-20 2>/dev/null"
+```
+
+Replace the date with whatever date has events in `events_silver`. Check available dates:
+```bash
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT toDate(timestamp) AS d, count() FROM events_silver GROUP BY d"
+```
+
+### Listing Registered DAGs
+
+```bash
+kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
+  bash -c "airflow dags list 2>/dev/null"
+```
+
+### Updating the DAG Code
+
+The DAG file is mounted from a ConfigMap. To update it:
+
+```bash
+# Update the ConfigMap from the local file
+kubectl create configmap airflow-dags \
+  --from-file=gold_user_activity.py=dags/gold_user_activity.py \
+  -n airflow --dry-run=client -o yaml | kubectl apply -f -
+
+# Restart the dag-processor and scheduler to pick up changes
+kubectl rollout restart deployment airflow-dag-processor -n airflow
+kubectl rollout restart statefulset airflow-scheduler -n airflow
+```
+
+### How the DAG Connects to ClickHouse
+
+The DAG uses the ClickHouse HTTP interface (port 8123) via Python `requests`. It connects as the `airflow` user (password `airflow123`), which is allowed from any namespace. No extra pip packages are needed.
+
+```
+URL:  http://chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local:8123/
+User: airflow / airflow123
+```
 
 ---
 
@@ -978,7 +1086,7 @@ docker build -f infrastructure/Dockerfile.final -t my-final-connect:1.2 .
 
 2. Load into Kind:
 ```bash
-./bin/kind.exe load docker-image my-final-connect:1.2 --name data-engineering-challenge
+kind load docker-image my-final-connect:1.2 --name data-engineering-challenge
 ```
 
 3. Update `kafka-connect.yaml` to reference the new tag:
@@ -1081,9 +1189,15 @@ kubectl exec -n database $MONGO_POD -- mongosh --eval "rs.status().members[0].st
 
 If not, re-initialize:
 ```bash
+# First try simple initiate (auto-detects hostname)
+kubectl exec -n database $MONGO_POD -- mongosh --eval "rs.initiate()"
+
+# If that fails with "already initialized", try reconfig:
 kubectl exec -n database $MONGO_POD -- mongosh --eval \
-  "rs.initiate({_id:'rs0',members:[{_id:0,host:'mongo-mongodb.database.svc.cluster.local:27017'}]})"
+  "rs.reconfig({_id:'rs0',members:[{_id:0,host:'mongo-mongodb.database.svc.cluster.local:27017'}]},{force:true})"
 ```
+
+> **Note**: `rs.initiate()` with the service DNS hostname may fail with "No host described maps to this node" because the service ClusterIP differs from the pod IP. Using `rs.initiate()` without arguments lets MongoDB pick the hostname automatically, then `rs.reconfig()` can set the service DNS name.
 
 ### Kafka Topics Are Empty After Connector Is READY
 
@@ -1113,6 +1227,35 @@ Compare the digest shown to your new build's digest (`docker images --digests my
 
 **Fix**: Always use a new tag. Kind caches images by tag — loading the same tag does not replace the cached image.
 
+### Kafka Connect 500 Errors After Cluster Restart
+
+**Problem**: After the Kafka broker restarts, the Connect internal topics (`connect-cluster-offsets`, `connect-cluster-configs`, `connect-cluster-status`) may be recreated with `cleanup.policy=delete` instead of `compact`. Connect refuses to start and returns 500 errors.
+
+**Fix**: Set the cleanup policy back to `compact`:
+```bash
+for topic in connect-cluster-offsets connect-cluster-configs connect-cluster-status; do
+  kubectl exec -n kafka my-cluster-my-pool-0 -- \
+    /opt/kafka/bin/kafka-configs.sh --bootstrap-server localhost:9092 \
+    --alter --entity-type topics --entity-name $topic \
+    --add-config cleanup.policy=compact
+done
+```
+
+Then restart the Connect pod:
+```bash
+kubectl delete pod -n kafka my-connect-cluster-connect-0
+```
+
+### Connect CrashLoopBackOff After Broker Restart
+
+**Problem**: When the Kafka broker restarts, Connect may try to bootstrap before the broker is ready and exit with "No resolvable bootstrap urls". Kubernetes enters exponential CrashLoopBackOff, with retry delays growing to minutes.
+
+**Fix**: Wait for the broker to be `1/1 Ready`, then delete the Connect pod to reset the backoff timer:
+```bash
+kubectl wait pod -n kafka my-cluster-my-pool-0 --for=condition=Ready --timeout=120s
+kubectl delete pod -n kafka my-connect-cluster-connect-0
+```
+
 ### "No such file or directory" When Using port-forward on Windows
 
 Git Bash on Windows can translate paths in command arguments. If you see path mangling (e.g., `/n` becoming `\n`), prefix paths with double slashes: `//opt//kafka//bin//...`.
@@ -1128,7 +1271,8 @@ Alternatively, wrap the path in quotes inside the `--eval` string.
 ```bash
 # == STATUS ==
 kubectl get pods -n kafka                          # All Kafka components
-kubectl get pods -n database                       # All databases
+kubectl get pods -n database                       # All databases + ClickHouse
+kubectl get pods -n airflow                        # Airflow components
 kubectl get kafkaconnector -n kafka                # CDC connector health
 
 # == DATABASES ==
@@ -1138,6 +1282,15 @@ MGPOD=$(kubectl get pod -n database -l app=mongo   -o jsonpath='{.items[0].metad
 kubectl exec -it -n database $PGPOD -- psql -U postgres        # PostgreSQL shell
 kubectl exec -it -n database $MGPOD -- mongosh \
   "mongodb://root:password123@localhost:27017/?authSource=admin" # MongoDB shell
+
+# == CLICKHOUSE ==
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT count() FROM users_silver"                    # Count users
+
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT * FROM gold_user_activity FINAL ORDER BY user_id"  # Gold table
 
 # == KAFKA ==
 kubectl exec -n kafka my-cluster-my-pool-0 -- \
@@ -1153,6 +1306,13 @@ kubectl port-forward pod/my-connect-cluster-connect-0 8083:8083 -n kafka &
 curl http://localhost:8083/                                       # Cluster info
 curl http://localhost:8083/connectors                            # List connectors
 curl http://localhost:8083/connectors/postgres-connector/status  # Connector status
+
+# == AIRFLOW ==
+kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
+  bash -c "airflow dags list 2>/dev/null"                       # List DAGs
+
+kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
+  bash -c "airflow tasks test gold_user_activity compute_gold_user_activity 2026-02-20 2>/dev/null"  # Test DAG
 
 # == RECOVERY ==
 kubectl delete pod -n kafka -l strimzi.io/kind=cluster-operator  # Unstick operator
