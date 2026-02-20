@@ -26,7 +26,7 @@ Kafka Topics
 | Component | Kind | Namespace | Details |
 |---|---|---|---|
 | Altinity ClickHouse Operator | Deployment | kube-system | v0.24.x — manages ClickHouseInstallation CRs |
-| ClickHouse cluster | ClickHouseInstallation | database | 1 shard / 1 replica, image `clickhouse/clickhouse-server:23.8` |
+| ClickHouse cluster | ClickHouseInstallation | database | 1 shard / 1 replica, image `clickhouse/clickhouse-server:24.8` |
 | Apache Airflow | Helm release `airflow` (chart 1.18.0) | airflow | Airflow 3.0.2, LocalExecutor, bundled PostgreSQL |
 
 ---
@@ -71,20 +71,20 @@ Key settings on both Kafka engine tables:
 
 | Table | Engine | Details |
 |---|---|---|
-| `gold_user_activity` | `ReplacingMergeTree(_updated_at)` | Daily aggregation of events per user per event type. Re-runs are idempotent — query with `FINAL` to deduplicate. |
+| `gold_user_activity` | `ReplacingMergeTree(_updated_at)` | Daily summary per user: total events + last event timestamp. Re-runs are idempotent — query with `FINAL` to deduplicate. |
 
 Schema:
 ```sql
 CREATE TABLE gold_user_activity (
-    date        Date,
-    user_id     Int32,
-    full_name   String,
-    email       String,
-    event_type  String,
-    event_count UInt64,
-    _updated_at DateTime DEFAULT now()
+    date           Date,
+    user_id        Int32,
+    full_name      String,
+    email          String,
+    total_events   UInt64,
+    last_event_at  DateTime,
+    _updated_at    DateTime DEFAULT now()
 ) ENGINE = ReplacingMergeTree(_updated_at)
-ORDER BY (date, user_id, event_type);
+ORDER BY (date, user_id);
 ```
 
 ---
@@ -118,14 +118,14 @@ ORDER BY (date, user_id, event_type);
 For the logical execution date `ds`, the task runs this ClickHouse query:
 
 ```sql
-INSERT INTO gold_user_activity (date, user_id, full_name, email, event_type, event_count)
+INSERT INTO gold_user_activity (date, user_id, full_name, email, total_events, last_event_at)
 SELECT
     toDate(e.timestamp)        AS date,
     u.user_id,
     anyLast(u.full_name)       AS full_name,
     anyLast(u.email)           AS email,
-    e.event_type,
-    count()                    AS event_count
+    count()                    AS total_events,
+    max(e.timestamp)           AS last_event_at
 FROM events_silver AS e
 INNER JOIN (
     SELECT user_id, full_name, email
@@ -133,10 +133,10 @@ INNER JOIN (
     WHERE  is_deleted = 0
 ) AS u ON e.user_id = u.user_id
 WHERE toDate(e.timestamp) = toDate('<ds>')
-GROUP BY date, u.user_id, e.event_type;
+GROUP BY date, u.user_id;
 ```
 
-**Why it's idempotent**: ClickHouse `ReplacingMergeTree` keeps the row with the highest `_updated_at` per `(date, user_id, event_type)`. Each re-run inserts fresh rows with `_updated_at = now()`, which supersede previous rows. Querying with `SELECT ... FROM gold_user_activity FINAL` always returns the most recent version.
+**Why it's idempotent**: ClickHouse `ReplacingMergeTree` keeps the row with the highest `_updated_at` per `(date, user_id)`. Each re-run inserts fresh rows with `_updated_at = now()`, which supersede previous rows. Querying with `SELECT ... FROM gold_user_activity FINAL` always returns the most recent version.
 
 ### ClickHouse Connection
 
@@ -203,11 +203,11 @@ Import from `airflow.providers.standard.operators.python` instead:
 from airflow.providers.standard.operators.python import PythonOperator
 ```
 
-### 6. ClickHouse 23.8 Kafka Engine incompatible with Kafka 4.0.0
+### 6. ClickHouse 23.8 Kafka Engine incompatible with Kafka 4.0.0 (RESOLVED)
 
 ClickHouse 23.8 bundles librdkafka ~2.0.x (from 2023) which returns `ERR__NOT_IMPLEMENTED` (-1001) for every message polled from Kafka 4.0.0. The Kafka engine tables (`users_queue`, `events_queue`) and their materialized views cannot consume data automatically.
 
-**Workaround**: Populate silver tables manually via `INSERT INTO ... VALUES` or by running the gold DAG which queries already-populated silver tables. A permanent fix requires upgrading ClickHouse to 24.x+ which ships a compatible librdkafka.
+**Fix**: Upgraded ClickHouse to 24.8 which ships librdkafka 2.6.x. Kafka engine tables now consume CDC events from Kafka 4.0.0 automatically.
 
 ---
 
@@ -275,16 +275,14 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 # Gold layer (after DAG run)
 kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" \
-  --query "SELECT date, user_id, full_name, event_type, event_count
+  --query "SELECT date, user_id, full_name, total_events, last_event_at
            FROM gold_user_activity FINAL
-           ORDER BY user_id, event_type"
+           ORDER BY user_id"
 
-# Expected gold output:
-# 2026-02-19  1  Alice Smith    login       1
-# 2026-02-19  1  Alice Smith    view_item   1
-# 2026-02-19  2  Bob A. Jones   add_to_cart 1
-# 2026-02-19  2  Bob A. Jones   login       1
-# 2026-02-19  3  Charlie Brown  login       1
+# Expected gold output (one row per user per day):
+# 2026-02-20  1  Alice Smith    2  2026-02-20 14:34:07
+# 2026-02-20  2  Bob A. Jones   2  2026-02-20 14:34:07
+# 2026-02-20  3  Charlie Brown  1  2026-02-20 14:34:07
 
 # DAG status via Airflow CLI
 kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \

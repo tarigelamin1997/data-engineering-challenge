@@ -1,10 +1,10 @@
 """
 gold_user_activity DAG — Phase 4 Gold Layer
 
-Runs daily. Aggregates events per user per day from the ClickHouse silver
-layer and writes summarized rows into gold_user_activity.
+Runs daily. For each user, summarises their total number of events and the
+timestamp of their last event for the previous day.
 
-Schedule: @daily (runs at midnight UTC, processes the current calendar day)
+Schedule: @daily (runs at midnight UTC, processes the previous calendar day)
 Idempotent: re-running for the same date inserts new rows with a newer
             _updated_at; querying with FINAL returns only the latest version.
 
@@ -36,22 +36,22 @@ def _run_ch_query(query: str) -> str:
 def compute_gold_user_activity(ds: str, **_) -> None:
     """
     For the given execution date `ds` (YYYY-MM-DD), join users_silver and
-    events_silver, count events per (date, user_id, event_type), and
-    insert the results into gold_user_activity.
+    events_silver, and for each user compute the total number of events and
+    the timestamp of their last event for that day.
 
     Using FINAL on users_silver ensures we get the latest (deduplicated) state
     of each user.
     """
     query = f"""
         INSERT INTO gold_user_activity
-            (date, user_id, full_name, email, event_type, event_count)
+            (date, user_id, full_name, email, total_events, last_event_at)
         SELECT
             toDate(e.timestamp)         AS date,
             u.user_id,
             anyLast(u.full_name)        AS full_name,
             anyLast(u.email)            AS email,
-            e.event_type,
-            count()                     AS event_count
+            count()                     AS total_events,
+            max(e.timestamp)            AS last_event_at
         FROM events_silver AS e
         INNER JOIN (
             SELECT user_id, full_name, email
@@ -59,7 +59,7 @@ def compute_gold_user_activity(ds: str, **_) -> None:
             WHERE  is_deleted = 0
         ) AS u ON e.user_id = u.user_id
         WHERE toDate(e.timestamp) = toDate('{ds}')
-        GROUP BY date, u.user_id, e.event_type
+        GROUP BY date, u.user_id
     """
     _run_ch_query(query)
     print(f"[gold_user_activity] Inserted gold rows for date={ds}")
