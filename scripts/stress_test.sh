@@ -16,6 +16,9 @@
 
 set -euo pipefail
 
+# Prevent Git-for-Windows from mangling /paths inside kubectl exec
+export MSYS_NO_PATHCONV=1
+
 MODE="${1:-both}"
 LOGFILE="scripts/stress_test_output.log"
 
@@ -27,15 +30,21 @@ POLL_INTERVAL=2        # seconds between ClickHouse count polls
 MAX_WAIT=120           # seconds before declaring TIMEOUT
 STABILIZE_WAIT=30      # seconds between waves
 
-# -- Pod / service names --
+# -- Pod names (resolved dynamically) --
 KAFKA_POD="my-cluster-my-pool-0"
 CH_POD="chi-chi-clickhouse-my-cluster-0-0-0"
-PG_POD="postgres-postgresql-0"
-MONGO_POD="mongo-mongodb-0"
 
 # -- Namespaces --
 NS_KAFKA="kafka"
 NS_DB="database"
+
+# Resolve Deployment-managed pod names via label selector
+resolve_pod() {
+    kubectl get pod -n "$1" -l "$2" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+}
+
+PG_POD=""
+MONGO_POD=""
 
 # =============================================================================
 # Helpers
@@ -53,21 +62,24 @@ ch_count() {
 }
 
 check_broker() {
-    local status
+    local status restarts
     status=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.phase}' 2>/dev/null || echo "Unknown")
-    local restarts
     restarts=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "?")
     echo "${status}(restarts=${restarts})"
 }
 
 check_connectors() {
-    local ready
-    ready=$(kubectl get kafkaconnector -n "$NS_KAFKA" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{" "}{end}' 2>/dev/null || echo "?")
-    echo "$ready"
+    local pg_state mongo_state
+    pg_state=$(kubectl exec -n "$NS_KAFKA" my-connect-cluster-connect-0 -- \
+        curl -s http://localhost:8083/connectors/postgres-connector/status 2>/dev/null \
+        | grep -o '"state":"[A-Z]*"' | tail -1 | grep -o '[A-Z]*' || echo "?")
+    mongo_state=$(kubectl exec -n "$NS_KAFKA" my-connect-cluster-connect-0 -- \
+        curl -s http://localhost:8083/connectors/mongo-connector/status 2>/dev/null \
+        | grep -o '"state":"[A-Z]*"' | tail -1 | grep -o '[A-Z]*' || echo "?")
+    echo "pg=${pg_state} mongo=${mongo_state}"
 }
 
 # Wait for ClickHouse row count to reach target, return elapsed seconds or TIMEOUT
-# Usage: wait_for_count <table> <target_count>
 wait_for_count() {
     local table="$1"
     local target="$2"
@@ -87,14 +99,14 @@ wait_for_count() {
 }
 
 print_header() {
-    printf "| %-5s | %-8s | %-16s | %-19s | %-15s | %-15s | %-30s |\n" \
+    printf "| %-5s | %-8s | %-16s | %-19s | %-22s | %-22s | %-30s |\n" \
         "Wave" "Rows" "e2e Latency (s)" "Throughput (rows/s)" "Broker Status" "Connect Status" "Notes"
-    printf "|-------|----------|-----------------|---------------------|-----------------|-----------------|--------------------------------|\n"
+    printf "|-------|----------|-----------------|---------------------|------------------------|------------------------|--------------------------------|\n"
 }
 
 print_row() {
     local wave="$1" rows="$2" latency="$3" throughput="$4" broker="$5" connect="$6" notes="$7"
-    printf "| %-5s | %-8s | %-15s | %-19s | %-15s | %-15s | %-30s |\n" \
+    printf "| %-5s | %-8s | %-15s | %-19s | %-22s | %-22s | %-30s |\n" \
         "$wave" "$rows" "$latency" "$throughput" "$broker" "$connect" "$notes"
 }
 
@@ -107,6 +119,9 @@ run_pg_waves() {
     log ""
     print_header | tee -a "$LOGFILE"
 
+    local broker_restarts_before
+    broker_restarts_before=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+
     local wave_num=0
     for n in "${WAVES[@]}"; do
         wave_num=$(( wave_num + 1 ))
@@ -116,14 +131,15 @@ run_pg_waves() {
         count_before=$(ch_count "users_silver")
         local target=$(( count_before + n ))
 
-        log "Wave $wave_num: inserting $n rows into PostgreSQL (current silver count: $count_before, target: $target)"
+        log "Wave $wave_num: inserting $n rows into PostgreSQL (current: $count_before, target: $target)"
 
         # Record start time
         local t_start
         t_start=$(date +%s)
 
         # INSERT N rows
-        kubectl exec -n "$NS_DB" "$PG_POD" -- psql -U myuser -d mydb -q -c \
+        kubectl exec -n "$NS_DB" "$PG_POD" -- \
+            psql -U postgres -d postgres -q -c \
             "INSERT INTO users (full_name, email) SELECT 'StressUser_' || g, 'stress_w${wave_num}_' || g || '@test.com' FROM generate_series(1, $n) AS g;" \
             2>/dev/null
 
@@ -134,10 +150,10 @@ run_pg_waves() {
         # Calculate throughput
         local throughput="—"
         if [[ "$latency" != "TIMEOUT" && "$latency" -gt 0 ]]; then
-            throughput=$(( n / latency ))
-            # Use bc for decimal precision if available
             if command -v bc &>/dev/null; then
                 throughput=$(echo "scale=1; $n / $latency" | bc)
+            else
+                throughput=$(( n / latency ))
             fi
         elif [[ "$latency" == "0" ]]; then
             throughput="instant"
@@ -148,11 +164,17 @@ run_pg_waves() {
         broker=$(check_broker)
         connect=$(check_connectors)
 
+        # Check for broker restarts during this wave
+        local restarts_now
+        restarts_now=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+        if (( restarts_now > broker_restarts_before )); then
+            notes="BROKER RESTARTED"
+        fi
+
         if [[ "$latency" == "TIMEOUT" ]]; then
-            notes="TIMEOUT after ${MAX_WAIT}s"
             local actual_count
             actual_count=$(ch_count "users_silver")
-            notes="$notes (got $actual_count/$target)"
+            notes="TIMEOUT (got $actual_count/$target)"
         fi
 
         print_row "$wave_num" "$n" "$latency" "$throughput" "$broker" "$connect" "$notes" | tee -a "$LOGFILE"
@@ -167,6 +189,8 @@ run_pg_waves() {
             log "*** BROKER CRASHED at wave $wave_num ($n rows) ***"
             break
         fi
+
+        broker_restarts_before="$restarts_now"
 
         # Stabilize between waves
         if (( wave_num < ${#WAVES[@]} )); then
@@ -192,6 +216,9 @@ run_mongo_waves() {
     num_users=$(ch_count "users_silver")
     if (( num_users < 1 )); then num_users=4; fi
 
+    local broker_restarts_before
+    broker_restarts_before=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+
     local wave_num=0
     for n in "${WAVES[@]}"; do
         wave_num=$(( wave_num + 1 ))
@@ -201,14 +228,13 @@ run_mongo_waves() {
         count_before=$(ch_count "events_silver")
         local target=$(( count_before + n ))
 
-        log "Wave $wave_num: inserting $n docs into MongoDB (current silver count: $count_before, target: $target)"
+        log "Wave $wave_num: inserting $n docs into MongoDB (current: $count_before, target: $target)"
 
         # Record start time
         local t_start
         t_start=$(date +%s)
 
         # Build JS for insertMany
-        # For large N, generate the array in a loop to avoid argument length limits
         local js_script
         js_script=$(cat <<MONGOSCRIPT
 var docs = [];
@@ -236,9 +262,10 @@ MONGOSCRIPT
         # Calculate throughput
         local throughput="—"
         if [[ "$latency" != "TIMEOUT" && "$latency" -gt 0 ]]; then
-            throughput=$(( n / latency ))
             if command -v bc &>/dev/null; then
                 throughput=$(echo "scale=1; $n / $latency" | bc)
+            else
+                throughput=$(( n / latency ))
             fi
         elif [[ "$latency" == "0" ]]; then
             throughput="instant"
@@ -249,11 +276,17 @@ MONGOSCRIPT
         broker=$(check_broker)
         connect=$(check_connectors)
 
+        # Check for broker restarts during this wave
+        local restarts_now
+        restarts_now=$(kubectl get pod -n "$NS_KAFKA" "$KAFKA_POD" -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo "0")
+        if (( restarts_now > broker_restarts_before )); then
+            notes="BROKER RESTARTED"
+        fi
+
         if [[ "$latency" == "TIMEOUT" ]]; then
-            notes="TIMEOUT after ${MAX_WAIT}s"
             local actual_count
             actual_count=$(ch_count "events_silver")
-            notes="$notes (got $actual_count/$target)"
+            notes="TIMEOUT (got $actual_count/$target)"
         fi
 
         print_row "$wave_num" "$n" "$latency" "$throughput" "$broker" "$connect" "$notes" | tee -a "$LOGFILE"
@@ -268,6 +301,8 @@ MONGOSCRIPT
             log "*** BROKER CRASHED at wave $wave_num ($n rows) ***"
             break
         fi
+
+        broker_restarts_before="$restarts_now"
 
         # Stabilize between waves
         if (( wave_num < ${#WAVES[@]} )); then
@@ -286,12 +321,27 @@ MONGOSCRIPT
 preflight() {
     log "========== Pre-Test Checks =========="
 
+    # Resolve dynamic pod names
+    PG_POD=$(resolve_pod "$NS_DB" "app=postgres")
+    MONGO_POD=$(resolve_pod "$NS_DB" "app=mongo")
+
+    if [[ -z "$PG_POD" ]]; then
+        log "ERROR: Could not find PostgreSQL pod"
+        exit 1
+    fi
+    if [[ -z "$MONGO_POD" ]]; then
+        log "ERROR: Could not find MongoDB pod"
+        exit 1
+    fi
+
+    log "Resolved pods: PG=$PG_POD  MONGO=$MONGO_POD"
+
     log "Checking pod status..."
-    kubectl get pods -n "$NS_KAFKA" -l strimzi.io/kind=Kafka 2>/dev/null | tee -a "$LOGFILE"
+    kubectl get pods -n "$NS_KAFKA" 2>/dev/null | tee -a "$LOGFILE"
     kubectl get pods -n "$NS_DB" 2>/dev/null | tee -a "$LOGFILE"
 
-    log "Connector status:"
-    kubectl get kafkaconnector -n "$NS_KAFKA" 2>/dev/null | tee -a "$LOGFILE"
+    log "Connector status (via REST API):"
+    log "  $(check_connectors)"
 
     log "Silver table baseline counts:"
     log "  users_silver:  $(ch_count users_silver)"

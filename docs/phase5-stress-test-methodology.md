@@ -117,7 +117,7 @@ We do **not** use arbitrary round numbers. Each test point is chosen because it 
 | `kafka_max_block_size` | 65536 | ClickHouse Kafka Engine | Max rows ClickHouse pulls from Kafka per poll. Not a bottleneck at our scale. |
 | `kafka_poll_timeout_ms` | 500 ms | ClickHouse Kafka Engine | How long ClickHouse waits for new messages per poll. Defines minimum MV flush interval. |
 | KRaft controller timeout | 5000 ms | Kafka broker (KRaft) | If the controller event loop takes > 5s, the broker is considered unresponsive. |
-| Kind node resources | ~4 vCPU, ~8 GB RAM | Docker Desktop | Hard ceiling on available compute. All services share this. |
+| Kind node resources | 8 vCPU, 10 GB RAM | Docker Desktop (WSL2) | Hard ceiling on available compute. All services share this. |
 
 ### 4.2 CPU Budget Analysis
 
@@ -137,11 +137,11 @@ Altinity operator         0.1             0.1
 Kubernetes system pods    0.3             0.5
 ─────────────────────────────────────────────────────
 TOTAL                     2.7             6.3
-Available                 ~4.0            ~4.0
-Headroom                  1.3            -2.3    ← cannot sustain full burst
+Available                 ~8.0            ~8.0
+Headroom                  5.3             1.7    ← can sustain burst with 8 CPUs
 ```
 
-**Key insight**: The system has ~1.3 cores of headroom at idle. Under full burst, it would need 6.3 cores but only has 4. The constraint is **CPU**, not memory or disk. The breaking point occurs when sustained CPU demand exceeds 4 cores long enough for the KRaft controller to timeout (5 seconds).
+**Key insight**: With 8 CPUs allocated, the system has ~5.3 cores of headroom at idle and ~1.7 cores even under full burst. This is sufficient to avoid KRaft controller timeouts. With the original 4-CPU default, headroom was only ~1.3 cores at idle and negative under burst — making CPU starvation the primary failure mode.
 
 ### 4.3 The Test Points
 
