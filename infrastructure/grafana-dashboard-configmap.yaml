@@ -1,0 +1,184 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: grafana-cdc-dashboard
+  namespace: monitoring
+  labels:
+    grafana_dashboard: "1"
+data:
+  cdc-pipeline.json: |
+    {
+      "annotations": { "list": [] },
+      "editable": false,
+      "fiscalYearStartMonth": 0,
+      "graphTooltip": 1,
+      "id": null,
+      "links": [],
+      "panels": [
+        {
+          "id": 1,
+          "title": "CDC Throughput — Events per Minute",
+          "type": "timeseries",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "targets": [
+            {
+              "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+              "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, count() AS events_per_minute FROM events_silver WHERE $__timeFilter(_ingested_at) GROUP BY time ORDER BY time",
+              "refId": "A",
+              "format": 1,
+              "queryType": "sql",
+              "editorType": "sql"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "palette-classic" },
+              "custom": {
+                "lineWidth": 2,
+                "fillOpacity": 15,
+                "spanNulls": true,
+                "axisBorderShow": false
+              },
+              "unit": "short",
+              "displayName": "Events/min"
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "single" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 2,
+          "title": "Active Users",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "targets": [
+            {
+              "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+              "rawSql": "SELECT count() AS active_users FROM users_silver FINAL WHERE is_deleted = 0",
+              "refId": "A",
+              "format": 2,
+              "queryType": "sql",
+              "editorType": "sql"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "orientation": "auto",
+            "textMode": "auto",
+            "colorMode": "background",
+            "graphMode": "none"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "blue" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 3,
+          "title": "Total Events",
+          "type": "stat",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "targets": [
+            {
+              "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+              "rawSql": "SELECT count() AS total_events FROM events_silver",
+              "refId": "A",
+              "format": 2,
+              "queryType": "sql",
+              "editorType": "sql"
+            }
+          ],
+          "options": {
+            "reduceOptions": { "calcs": ["lastNotNull"] },
+            "colorMode": "background",
+            "graphMode": "none"
+          },
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "orange" },
+              "thresholds": { "mode": "absolute", "steps": [{ "color": "orange", "value": null }] }
+            },
+            "overrides": []
+          }
+        },
+        {
+          "id": 5,
+          "title": "CDC Throughput — Users per Minute",
+          "type": "timeseries",
+          "gridPos": { "h": 4, "w": 12, "x": 12, "y": 4 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "targets": [
+            {
+              "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+              "rawSql": "SELECT toStartOfMinute(_ingested_at) AS time, count() AS users_per_minute FROM users_silver WHERE $__timeFilter(_ingested_at) GROUP BY time ORDER BY time",
+              "refId": "A",
+              "format": 1,
+              "queryType": "sql",
+              "editorType": "sql"
+            }
+          ],
+          "fieldConfig": {
+            "defaults": {
+              "color": { "mode": "fixed", "fixedColor": "green" },
+              "custom": { "lineWidth": 2, "fillOpacity": 15, "spanNulls": true },
+              "unit": "short",
+              "displayName": "Users/min"
+            },
+            "overrides": []
+          },
+          "options": {
+            "tooltip": { "mode": "single" },
+            "legend": { "displayMode": "list", "placement": "bottom" }
+          }
+        },
+        {
+          "id": 4,
+          "title": "Gold Layer — User Activity Summary",
+          "type": "table",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "targets": [
+            {
+              "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+              "rawSql": "SELECT date, user_id, full_name, email, total_events, last_event_at FROM gold_user_activity FINAL ORDER BY date DESC, total_events DESC LIMIT 50",
+              "refId": "A",
+              "format": 2,
+              "queryType": "sql",
+              "editorType": "sql"
+            }
+          ],
+          "options": {
+            "showHeader": true,
+            "sortBy": [{ "displayName": "total_events", "desc": true }]
+          },
+          "fieldConfig": {
+            "defaults": {},
+            "overrides": [
+              {
+                "matcher": { "id": "byName", "options": "total_events" },
+                "properties": [{ "id": "custom.width", "value": 120 }]
+              }
+            ]
+          }
+        }
+      ],
+      "refresh": "30s",
+      "schemaVersion": 39,
+      "tags": ["cdc", "clickhouse", "phase6"],
+      "templating": { "list": [] },
+      "time": { "from": "now-6h", "to": "now" },
+      "timepicker": {},
+      "timezone": "browser",
+      "title": "CDC Pipeline Overview",
+      "uid": "cdc-pipeline-v1",
+      "version": 1
+    }

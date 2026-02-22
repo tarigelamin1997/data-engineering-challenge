@@ -1,0 +1,78 @@
+# Grafana Helm values — Phase 6 CDC Pipeline Dashboard
+# Chart: grafana/grafana
+# Namespace: monitoring
+# Access: kubectl port-forward svc/grafana 3000:3000 -n monitoring
+
+# ── Credentials ──────────────────────────────────────────────────────────────
+adminUser: admin
+adminPassword: admin
+
+# ── Service: ClusterIP only (accessed via port-forward) ──────────────────────
+service:
+  type: ClusterIP
+  port: 3000
+
+# ── Resource constraints (minimal — single Kind node) ────────────────────────
+resources:
+  requests:
+    cpu: "100m"
+    memory: "256Mi"
+  limits:
+    cpu: "300m"
+    memory: "512Mi"
+
+# ── Disable persistence (dashboards are in ConfigMap) ────────────────────────
+persistence:
+  enabled: false
+
+# ── Plugin installation: official ClickHouse datasource ──────────────────────
+plugins:
+  - grafana-clickhouse-datasource
+
+# ── Datasource: ClickHouse via HTTP ──────────────────────────────────────────
+# Uses the 'airflow' user which has unrestricted network access from all namespaces.
+datasources:
+  datasources.yaml:
+    apiVersion: 1
+    datasources:
+      - name: ClickHouse
+        uid: clickhouse
+        type: grafana-clickhouse-datasource
+        access: proxy
+        isDefault: true
+        editable: false
+        jsonData:
+          server: chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local
+          port: 8123
+          protocol: http
+          defaultDatabase: default
+          username: airflow
+          tlsSkipVerify: true
+        secureJsonData:
+          password: airflow123
+
+# ── Dashboard provider ───────────────────────────────────────────────────────
+dashboardProviders:
+  dashboardproviders.yaml:
+    apiVersion: 1
+    providers:
+      - name: cdc-pipeline
+        orgId: 1
+        folder: "CDC Pipeline"
+        type: file
+        disableDeletion: true
+        editable: false
+        options:
+          path: /var/lib/grafana/dashboards/cdc-pipeline
+
+dashboardsConfigMaps:
+  cdc-pipeline: grafana-cdc-dashboard
+
+# ── Grafana INI overrides ────────────────────────────────────────────────────
+grafana.ini:
+  analytics:
+    check_for_updates: false
+    reporting_enabled: false
+  log:
+    mode: console
+    level: warn

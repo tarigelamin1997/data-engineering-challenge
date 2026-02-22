@@ -18,8 +18,9 @@ MongoDB (events)    ──┘                                         (Silver)  
 |---|---|
 | Platform | [Kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker) |
 | Streaming | [Strimzi](https://strimzi.io/) (Kafka 4.0.0, KRaft) + [Debezium](https://debezium.io/) 2.7.0 (CDC) |
-| Analytics | [ClickHouse](https://clickhouse.com/) 23.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
-| Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.0.2 |
+| Analytics | [ClickHouse](https://clickhouse.com/) 24.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
+| Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.1.7 |
+| Observability | [Grafana](https://grafana.com/) with native ClickHouse plugin |
 
 ## Prerequisites
 
@@ -124,6 +125,22 @@ helm install airflow apache-airflow/airflow \
   --timeout 10m
 ```
 
+### 9. Deploy Grafana Dashboard
+
+```bash
+kubectl create namespace monitoring
+helm repo add grafana https://grafana.github.io/helm-charts && helm repo update grafana
+kubectl apply -f infrastructure/grafana-dashboard-configmap.yaml
+helm install grafana grafana/grafana \
+  --namespace monitoring \
+  --values infrastructure/grafana-values.yaml \
+  --timeout 5m
+kubectl wait pod -n monitoring -l app.kubernetes.io/name=grafana --for=condition=Ready --timeout=120s
+
+# Access at http://localhost:3000 (admin / admin)
+kubectl port-forward svc/grafana 3000:3000 -n monitoring
+```
+
 ## Verification
 
 ```bash
@@ -147,7 +164,11 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 # Gold table (after DAG run)
 kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" \
-  --query "SELECT * FROM gold_user_activity FINAL ORDER BY user_id, event_type"
+  --query "SELECT * FROM gold_user_activity FINAL ORDER BY date DESC, user_id"
+
+# Grafana dashboard
+kubectl port-forward svc/grafana 3000:3000 -n monitoring
+# Open http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview
 ```
 
 ## Repository Structure
@@ -165,14 +186,17 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 │   ├── mongo.yaml                  # MongoDB 5.0 Deployment + Service (ReplicaSet)
 │   ├── secrets.yaml                # DB credentials (Kubernetes Secrets)
 │   ├── clickhouse.yaml             # ClickHouse cluster (Altinity CHI)
-│   └── airflow-values.yaml         # Airflow Helm chart values
+│   ├── airflow-values.yaml         # Airflow Helm chart values
+│   ├── grafana-values.yaml         # Grafana Helm chart values
+│   └── grafana-dashboard-configmap.yaml  # Grafana dashboard JSON (5 panels)
 ├── scripts/
 │   ├── seed_postgres.sql           # Creates and seeds the users table
 │   ├── seed_mongo.js               # Seeds the commerce.events collection
 │   ├── create_tables.sql           # ClickHouse bronze + silver schema
 │   ├── create_gold.sql             # ClickHouse gold table
 │   ├── create_bronze.sql           # ClickHouse Kafka engine tables (standalone)
-│   └── create_silver.sql           # ClickHouse silver layer (standalone)
+│   ├── create_silver.sql           # ClickHouse silver layer (standalone)
+│   └── stress_test.sh              # Automated CDC stress test (8 progressive waves)
 ├── dags/
 │   └── gold_user_activity.py       # Airflow DAG — daily gold aggregation
 ├── docs/
@@ -180,6 +204,9 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 │   ├── phase2-kafka-cluster.md     # Phase 2: Kafka KRaft + Connect image
 │   ├── phase3-cdc-pipeline.md      # Phase 3: Debezium connectors + CDC
 │   ├── phase4-gold-layer.md        # Phase 4: ClickHouse + Airflow
+│   ├── phase5-stress-test-methodology.md  # Stress test design and rationale
+│   ├── phase5-stress-test-results.md      # Stress test results and outcomes
+│   ├── phase6-grafana-dashboard.md        # Grafana deployment and dashboard guide
 │   ├── how-to-test-and-operate.md  # Operations manual and troubleshooting
 │   ├── 01-Logical-Data-Flow-Architecture.png
 │   ├── 02-Physical-Kubernetes-Architecture-Self-Hosted.png
@@ -197,6 +224,9 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 | [Phase 3 — CDC Pipeline](docs/phase3-cdc-pipeline.md) | Debezium connectors, CDC message format, connector troubleshooting |
 | [Phase 4 — Gold Layer](docs/phase4-gold-layer.md) | ClickHouse schema, Airflow DAG, gold aggregation |
 | [How to Test and Operate](docs/how-to-test-and-operate.md) | Full operations manual: health checks, testing, recovery, troubleshooting |
+| [Phase 5 — Stress Test Methodology](docs/phase5-stress-test-methodology.md) | Test design, CPU budget analysis, 8 progressive wave rationale |
+| [Phase 5 — Stress Test Results](docs/phase5-stress-test-results.md) | Results: 25K rows at 4,166–6,250 rows/s with sub-linear latency |
+| [Phase 6 — Grafana Dashboard](docs/phase6-grafana-dashboard.md) | Live observability dashboard with ClickHouse datasource |
 
 ## Status
 
@@ -206,3 +236,5 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 | 2 | Kafka cluster (KRaft mode) + Connect image | Done |
 | 3 | CDC pipeline (Kafka Connect + Debezium) | Done |
 | 4 | ClickHouse ingestion + Airflow gold DAG | Done |
+| 5 | Stress testing (methodology + automated script) | Done |
+| 6 | Grafana observability dashboard | Done |
