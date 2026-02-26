@@ -8,8 +8,8 @@ A production-grade CDC data pipeline running on local Kubernetes (Kind). Changes
 
 ```
 PostgreSQL (users)  ──┐
-                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ──► Airflow
-MongoDB (events)    ──┘                                         (Silver)       (Gold)
+                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ──► dbt ──► Airflow
+MongoDB (events)    ──┘                                         (Silver)     (Gold)    (Orchestrator)
 ```
 
 ## Tech Stack
@@ -19,6 +19,7 @@ MongoDB (events)    ──┘                                         (Silver)  
 | Platform | [Kind](https://kind.sigs.k8s.io/) (Kubernetes in Docker) |
 | Streaming | [Strimzi](https://strimzi.io/) (Kafka 4.0.0, KRaft) + [Debezium](https://debezium.io/) 2.7.0 (CDC) |
 | Analytics | [ClickHouse](https://clickhouse.com/) 24.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
+| Transformation | [dbt](https://www.getdbt.com/) 1.11 + [dbt-clickhouse](https://github.com/ClickHouse/dbt-clickhouse) adapter |
 | Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.1.7 |
 | Observability | [Grafana](https://grafana.com/) with native ClickHouse plugin |
 
@@ -197,8 +198,16 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 │   ├── create_bronze.sql           # ClickHouse Kafka engine tables (standalone)
 │   ├── create_silver.sql           # ClickHouse silver layer (standalone)
 │   └── stress_test.sh              # Automated CDC stress test (8 progressive waves)
+├── dbt/
+│   ├── dbt_project.yml             # dbt project config
+│   ├── profiles.yml                # ClickHouse connection profile
+│   ├── models/
+│   │   ├── staging/                # Ephemeral staging models (stg_users, stg_events)
+│   │   └── gold/                   # Incremental gold model (gold_user_activity)
+│   ├── macros/                     # Custom macros (reserved)
+│   └── tests/                      # Custom data tests (reserved)
 ├── dags/
-│   └── gold_user_activity.py       # Airflow DAG — daily gold aggregation
+│   └── gold_user_activity.py       # Airflow DAG — dbt run + dbt test
 ├── docs/
 │   ├── phase1-environment-setup.md # Phase 1: Kind, Strimzi, databases
 │   ├── phase2-kafka-cluster.md     # Phase 2: Kafka KRaft + Connect image
@@ -240,6 +249,31 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | 4 | ClickHouse ingestion + Airflow gold DAG | Done |
 | 5 | Stress testing (methodology + automated script) | Done |
 | 6 | Grafana observability dashboard | Done |
+
+## dbt Transformation Layer
+
+dbt manages the silver → gold transformation with clear layer boundaries:
+
+| Layer | Materialization | Engine | What it does |
+|---|---|---|---|
+| `stg_users` | Ephemeral (CTE) | — | Deduplicates users via `FINAL`, filters soft-deletes |
+| `stg_events` | Ephemeral (CTE) | — | Passes through event facts |
+| `gold_user_activity` | Incremental (append) | ReplacingMergeTree | Daily per-user aggregation |
+
+**Run locally** (Kind cluster exposes ClickHouse at `localhost:8123`):
+
+```bash
+cd dbt
+dbt debug          # verify connection
+dbt run            # build gold table
+dbt test           # run not_null assertions
+```
+
+**Design decisions**:
+- **Ephemeral staging**: no intermediate tables — staging models compile as CTEs into the gold query
+- **Append strategy**: new rows inserted with `_updated_at = now()`; `FINAL` deduplicates on read — matches ReplacingMergeTree semantics
+- **No `unique` tests**: ClickHouse only deduplicates on merge/FINAL, so uniqueness tests would produce false failures
+- **Production path**: Airflow DAG uses BashOperator pattern; in production, replace with KubernetesPodOperator running a dbt Docker image
 
 ## Known Gaps & Next Steps
 

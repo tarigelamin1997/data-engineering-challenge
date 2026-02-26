@@ -1,0 +1,36 @@
+version: 2
+
+models:
+  - name: gold_user_activity
+    description: >
+      Daily per-user activity summary. Joins active users with their events
+      and aggregates total_events and last_event_at by (date, user_id).
+      Materialized as incremental on ReplacingMergeTree(_updated_at) —
+      re-runs are idempotent via FINAL deduplication.
+    columns:
+      - name: date
+        description: "Calendar date of the activity"
+        tests:
+          - not_null
+      - name: user_id
+        description: "User identifier"
+        tests:
+          - not_null
+      - name: full_name
+        description: "User full name at time of aggregation"
+        tests:
+          - not_null
+      - name: email
+        description: "User email at time of aggregation"
+        tests:
+          - not_null
+      - name: total_events
+        description: "Count of events for this user on this date"
+        tests:
+          - not_null
+      - name: last_event_at
+        description: "Timestamp of the user's last event on this date"
+        tests:
+          - not_null
+      - name: _updated_at
+        description: "Row version timestamp for ReplacingMergeTree deduplication"

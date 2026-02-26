@@ -1,0 +1,66 @@
+version: 2
+
+sources:
+  - name: silver
+    database: default
+    schema: default
+    description: "CDC silver layer tables populated by Kafka Engine + Materialized Views"
+    tables:
+      - name: users_silver
+        description: "Deduplicated user dimension from PostgreSQL CDC (ReplacingMergeTree)"
+        columns:
+          - name: user_id
+            description: "Primary key from PostgreSQL users table"
+          - name: full_name
+            description: "User full name"
+          - name: email
+            description: "User email address"
+          - name: updated_at
+            description: "Last update timestamp from source"
+          - name: is_deleted
+            description: "Soft-delete flag (1 = deleted via Debezium 'd' op)"
+
+      - name: events_silver
+        description: "Append-only event facts from MongoDB CDC (MergeTree)"
+        columns:
+          - name: user_id
+            description: "Foreign key to users_silver"
+          - name: event_type
+            description: "Event type (page_view, add_to_cart, purchase, etc.)"
+          - name: timestamp
+            description: "Event timestamp from MongoDB BSON Date"
+          - name: metadata
+            description: "Raw JSON metadata object from MongoDB document"
+
+models:
+  - name: stg_users
+    description: "Active (non-deleted) users with FINAL deduplication applied"
+    columns:
+      - name: user_id
+        description: "Primary key"
+        tests:
+          - not_null
+      - name: full_name
+        description: "User full name"
+        tests:
+          - not_null
+      - name: email
+        description: "User email"
+        tests:
+          - not_null
+
+  - name: stg_events
+    description: "All events from the silver layer"
+    columns:
+      - name: user_id
+        description: "Foreign key to stg_users"
+        tests:
+          - not_null
+      - name: event_type
+        description: "Event type"
+        tests:
+          - not_null
+      - name: timestamp
+        description: "Event timestamp"
+        tests:
+          - not_null

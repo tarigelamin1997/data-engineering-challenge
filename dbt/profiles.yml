@@ -1,0 +1,11 @@
+cdc_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: clickhouse
+      schema: default
+      host: "{{ env_var('DBT_CH_HOST', 'localhost') }}"
+      port: 8123
+      user: "{{ env_var('DBT_CH_USER', 'airflow') }}"
+      password: "{{ env_var('DBT_CH_PASSWORD', 'airflow123') }}"
+      secure: false
