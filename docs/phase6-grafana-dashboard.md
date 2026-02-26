@@ -123,7 +123,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | Pod stuck in `Init` state | Plugin downloading from grafana.com | Wait 60s. Check: `kubectl logs -n monitoring -l app.kubernetes.io/name=grafana -c init-chown-data` |
 | "Data source is not working" | ClickHouse pod not ready or wrong credentials | Verify: `kubectl get pods -n database`, check `airflow` user exists in ClickHouse |
 | Dashboard shows "No data" on time series | No events in selected time range | Change time range to "Last 7 days" or insert new data |
-| Gold panel empty | Airflow DAG hasn't run | Run: `kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- airflow dags test gold_user_activity 2026-02-22` |
+| Gold panel empty | Airflow DAG hasn't run (dbt not triggered) | Run: `kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'` |
 | Port 3000 already in use | Another process on 3000 | Use a different local port: `kubectl port-forward svc/grafana 3001:3000 -n monitoring` |
 
 ---

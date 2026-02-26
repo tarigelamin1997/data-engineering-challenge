@@ -7,9 +7,14 @@ A production-grade CDC data pipeline running on local Kubernetes (Kind). Changes
 **Pipeline Architecture**:
 
 ```
-PostgreSQL (users)  ──┐
-                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ──► dbt ──► Airflow
-MongoDB (events)    ──┘                                         (Silver)     (Gold)    (Orchestrator)
+PostgreSQL (users)  ──┐                                                    ┌─────────────────────┐
+                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ─┤  Airflow (dbt)      │
+MongoDB (events)    ──┘                                         (Silver)   │  BashOperator       │
+                                                                           │  dbt run → dbt test │
+                                                                           └─────────┬───────────┘
+                                                                                     ▼
+                                                                              gold_user_activity
+                                                                              (Gold Layer)
 ```
 
 ## Tech Stack
@@ -20,7 +25,7 @@ MongoDB (events)    ──┘                                         (Silver)  
 | Streaming | [Strimzi](https://strimzi.io/) (Kafka 4.0.0, KRaft) + [Debezium](https://debezium.io/) 2.7.0 (CDC) |
 | Analytics | [ClickHouse](https://clickhouse.com/) 24.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
 | Transformation | [dbt](https://www.getdbt.com/) 1.11 + [dbt-clickhouse](https://github.com/ClickHouse/dbt-clickhouse) adapter |
-| Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.1.7 |
+| Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.0.2 (custom image with dbt baked in) |
 | Observability | [Grafana](https://grafana.com/) with native ClickHouse plugin |
 
 ## Prerequisites
@@ -115,11 +120,17 @@ kubectl exec -i -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" --multiquery < scripts/create_gold.sql
 ```
 
-### 8. Deploy Airflow
+### 8. Build Custom Airflow Image and Deploy
 
 ```bash
+# Build Airflow image with dbt baked in
+docker build -f infrastructure/Dockerfile.airflow-dbt -t airflow-dbt:1.0 .
+kind load docker-image airflow-dbt:1.0 --name data-engineering-challenge
+
+# Deploy Airflow
 kubectl create namespace airflow
 kubectl create configmap airflow-dags -n airflow --from-file=dags/gold_user_activity.py
+helm repo add apache-airflow https://airflow.apache.org && helm repo update apache-airflow
 helm install airflow apache-airflow/airflow \
   --namespace airflow \
   --values infrastructure/airflow-values.yaml \
@@ -149,6 +160,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 kubectl get pods -n kafka
 kubectl get pods -n database
 kubectl get pods -n airflow
+kubectl get pods -n monitoring
 
 # Both CDC connectors READY=True
 kubectl get kafkaconnector -n kafka
@@ -162,10 +174,14 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" \
   --query "SELECT count() FROM users_silver; SELECT count() FROM events_silver;"
 
-# Gold table (after DAG run)
+# Trigger dbt via Airflow DAG (builds + tests the gold table)
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null | tail -5'
+
+# Verify gold table has data
 kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" \
-  --query "SELECT * FROM gold_user_activity FINAL ORDER BY date DESC, user_id"
+  --query "SELECT * FROM gold_user_activity FINAL ORDER BY date DESC, user_id LIMIT 10"
 
 # Grafana dashboard
 kubectl port-forward svc/grafana 3000:3000 -n monitoring
@@ -187,7 +203,8 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 │   ├── mongo.yaml                  # MongoDB 5.0 Deployment + Service (ReplicaSet)
 │   ├── secrets.yaml                # DB credentials (Kubernetes Secrets)
 │   ├── clickhouse.yaml             # ClickHouse cluster (Altinity CHI)
-│   ├── airflow-values.yaml         # Airflow Helm chart values
+│   ├── Dockerfile.airflow-dbt       # Custom Airflow image (Airflow 3.0.2 + dbt-core + dbt-clickhouse)
+│   ├── airflow-values.yaml         # Airflow Helm chart values (custom image, dbt env vars)
 │   ├── grafana-values.yaml         # Grafana Helm chart values
 │   └── grafana-dashboard-configmap.yaml  # Grafana dashboard JSON (5 panels)
 ├── scripts/
@@ -260,8 +277,21 @@ dbt manages the silver → gold transformation with clear layer boundaries:
 | `stg_events` | Ephemeral (CTE) | — | Passes through event facts |
 | `gold_user_activity` | Incremental (append) | ReplacingMergeTree | Daily per-user aggregation |
 
-**Run locally** (Kind cluster exposes ClickHouse at `localhost:8123`):
+**Orchestration**: dbt is baked into the Airflow image (`airflow-dbt:1.0`) and triggered by the `gold_user_activity` DAG:
 
+```
+BashOperator(dbt_run)  →  BashOperator(dbt_test)
+   dbt run --select         dbt test --select
+   gold_user_activity       gold_user_activity
+```
+
+**Run via Airflow** (inside the cluster):
+```bash
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'
+```
+
+**Run locally** (for development — requires `kubectl port-forward` to ClickHouse on `localhost:8123`):
 ```bash
 cd dbt
 dbt debug          # verify connection
@@ -269,11 +299,17 @@ dbt run            # build gold table
 dbt test           # run not_null assertions
 ```
 
+**Custom Airflow image** ([Dockerfile.airflow-dbt](infrastructure/Dockerfile.airflow-dbt)):
+- Base: `apache/airflow:3.0.2`
+- Adds: `dbt-core==1.11.6`, `dbt-clickhouse==1.10.0`
+- Copies `dbt/` project into `/opt/airflow/dbt/`
+- Env vars (`DBT_CH_HOST`, `DBT_CH_USER`, `DBT_CH_PASSWORD`) set via Helm values for in-cluster ClickHouse DNS
+
 **Design decisions**:
 - **Ephemeral staging**: no intermediate tables — staging models compile as CTEs into the gold query
 - **Append strategy**: new rows inserted with `_updated_at = now()`; `FINAL` deduplicates on read — matches ReplacingMergeTree semantics
 - **No `unique` tests**: ClickHouse only deduplicates on merge/FINAL, so uniqueness tests would produce false failures
-- **Production path**: Airflow DAG uses BashOperator pattern; in production, replace with KubernetesPodOperator running a dbt Docker image
+- **Production path**: replace BashOperator with KubernetesPodOperator running a dedicated dbt Docker image — isolates dbt dependencies from the Airflow runtime
 
 ## Known Gaps & Next Steps
 

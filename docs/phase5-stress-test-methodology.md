@@ -219,7 +219,19 @@ After each wave:
 
 ---
 
-## 7. Output Format
+## 7. Gold Layer Verification
+
+After all waves complete, we verify that the dbt transformation layer correctly processes stress-test data:
+
+1. Run `dbt run` via the Airflow DAG (triggers inside the scheduler pod)
+2. Run `dbt test` to validate `not_null` assertions on the gold table
+3. Query `gold_user_activity FINAL` to confirm correct aggregation
+
+This step ensures the gold layer handles high-volume data without issues — particularly that the incremental append strategy and ReplacingMergeTree deduplication work correctly at scale.
+
+---
+
+## 8. Output Format
 
 Results will be recorded in [phase5-stress-test-results.md](phase5-stress-test-results.md) with:
 

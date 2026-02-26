@@ -64,7 +64,7 @@ The pipeline's polling floor is ~2 seconds (Debezium 500ms + ClickHouse 500ms + 
 
 The `gold_user_activity` table has not been updated in more than 25 hours. Since the Airflow DAG runs daily, a 25-hour threshold catches a missed run while allowing a 1-hour buffer for DAG execution time and scheduling jitter.
 
-This alert catches a silent Airflow DAG failure. Unlike a connector crash (which may produce errors), a failed DAG often leaves no visible signal in Grafana — the gold layer simply stops refreshing. Business users querying aggregated user activity would see stale numbers with no warning.
+This alert catches a silent Airflow DAG or dbt failure. Unlike a connector crash (which may produce errors), a failed dbt run often leaves no visible signal in Grafana — the gold layer simply stops refreshing. Business users querying aggregated user activity would see stale numbers with no warning. Since dbt is now triggered by Airflow's `gold_user_activity` DAG (via BashOperator), both DAG scheduling failures and dbt model failures are caught by this alert.
 
 ### Implementation
 
@@ -84,9 +84,10 @@ The Airflow DAG `gold_user_activity` runs once per day. A 24-hour threshold woul
 
 ### First Response Checklist
 
-- `kubectl get pods -n airflow` — check scheduler and worker pods
+- `kubectl get pods -n airflow` — check scheduler and dag-processor pods
 - Airflow UI: `http://localhost:8080` — check `gold_user_activity` DAG run history
-- `kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- airflow dags test gold_user_activity $(date +%Y-%m-%d)`
+- Run dbt manually to test: `kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- bash -c 'cd /opt/airflow/dbt && dbt run --select gold_user_activity'`
+- Run dbt debug to check connection: `kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- bash -c 'cd /opt/airflow/dbt && dbt debug'`
 - Check ClickHouse: `SELECT max(last_event_at) FROM gold_user_activity FINAL` — confirm staleness
 
 ---
@@ -110,6 +111,10 @@ On a Kind cluster, Grafana can use its built-in email or webhook contact points.
 When asked about monitoring in interviews, acknowledge this gap and explain the fix:
 
 > *"My current implementation has dashboards but no alerting rules — that's a known gap. In production I'd add two alerts: a throughput flatline detector for connector failures with a 2-minute pending period to avoid false positives, and a gold layer staleness alert with a 25-hour threshold to catch missed Airflow DAG runs. The throughput alert is higher priority because silent data loss is worse than a stale aggregate — at least a stale aggregate is still correct for the time it covers."*
+
+When asked about the transformation layer:
+
+> *"dbt manages the silver → gold transformation. It's baked into a custom Airflow image and triggered by a DAG with two tasks: `dbt run` builds the incremental gold model, then `dbt test` runs not_null assertions as a data quality gate. In production, I'd replace the BashOperator with a KubernetesPodOperator running a dedicated dbt image — this isolates dbt dependencies and allows model updates without rebuilding the Airflow image."*
 
 ---
 

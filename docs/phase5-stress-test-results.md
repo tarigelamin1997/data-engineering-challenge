@@ -118,7 +118,24 @@ Since no component broke, recommendations focus on what would be needed to push 
    - Use ClickHouse ReplicatedMergeTree with multiple shards
    - Separate broker, Connect, and ClickHouse onto dedicated nodes
 
-### 5. Production Extrapolation
+### 5. dbt Gold Layer Verification
+
+After completing all stress test waves, we verified that dbt correctly processes the stress-test data into the gold layer:
+
+```bash
+# Run dbt via Airflow DAG (inside the cluster)
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'
+```
+
+**Results**:
+- `dbt_run`: PASS=1 — the incremental gold model processed all 42K+ silver rows
+- `dbt_test`: PASS=6 — all `not_null` assertions passed on the stress-test data
+- `gold_user_activity FINAL`: 25,005 deduplicated rows (one per user per day)
+
+This confirms the gold transformation layer handles stress-test volumes correctly — the incremental append strategy and ReplacingMergeTree deduplication work as designed at scale.
+
+### 6. Production Extrapolation
 
 | Metric | Kind Cluster (8 vCPU) | Estimated Production (dedicated nodes) |
 |--------|----------------------|----------------------------------------|

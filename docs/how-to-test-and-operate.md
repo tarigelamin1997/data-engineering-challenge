@@ -16,7 +16,7 @@ This guide explains everything about how the CDC data pipeline works and how to 
 8. [Working with Kafka Connect and Debezium](#8-working-with-kafka-connect-and-debezium)
 9. [Testing the CDC Pipeline End-to-End](#9-testing-the-cdc-pipeline-end-to-end)
 10. [Working with ClickHouse](#10-working-with-clickhouse)
-10.5. [Working with Airflow](#105-working-with-airflow)
+10.5. [Working with Airflow and dbt](#105-working-with-airflow-and-dbt)
 11. [Common Operational Tasks](#11-common-operational-tasks)
 12. [Troubleshooting Guide](#12-troubleshooting-guide)
 
@@ -32,7 +32,8 @@ The pipeline runs entirely inside a single-node Kind cluster (Docker container a
 |---|---|
 | `kafka` | Strimzi operator, Kafka broker (KRaft), Kafka Connect, CDC connectors, credential Secrets |
 | `database` | PostgreSQL 13, MongoDB 5.0, ClickHouse 24.8 |
-| `airflow` | Airflow 3.0.2 (scheduler, dag-processor, triggerer, api-server, bundled PostgreSQL) |
+| `airflow` | Airflow 3.0.2 (custom `airflow-dbt:1.0` image with dbt baked in; scheduler, dag-processor, triggerer, api-server, bundled PostgreSQL) |
+| `monitoring` | Grafana (ClickHouse datasource, CDC Pipeline Overview dashboard) |
 
 ### Port Mappings (Host → Cluster)
 
@@ -132,6 +133,7 @@ Run these commands in order. If anything is not `Running` or `Ready`, see [Secti
 kubectl get pods -n kafka
 kubectl get pods -n database
 kubectl get pods -n airflow
+kubectl get pods -n monitoring
 ```
 
 **Expected `kafka` namespace output**:
@@ -878,7 +880,7 @@ Expected tables after schema deployment:
 - `events_queue` — Kafka engine (Bronze layer, reads from `mongo.commerce.events`)
 - `events_silver` — MergeTree (Silver layer, raw events)
 - `mv_events` — Materialized View (auto-populates `events_silver`)
-- `gold_user_activity` — ReplacingMergeTree (Gold layer, daily per-user aggregation — populated by Airflow DAG)
+- `gold_user_activity` — ReplacingMergeTree (Gold layer, daily per-user aggregation — managed by dbt, triggered by Airflow DAG)
 
 ### Querying Silver Tables
 
@@ -928,11 +930,11 @@ ORDER BY user_id;
 
 1. **Bronze**: `users_queue` / `events_queue` (Kafka Engine) auto-consume raw CDC JSON from Kafka topics
 2. **Silver**: Materialized Views (`mv_users`, `mv_events`) parse the Debezium JSON and write into `users_silver` (ReplacingMergeTree) and `events_silver` (MergeTree)
-3. **Gold**: The Airflow DAG `gold_user_activity` runs daily, joins silver tables, and writes aggregated results into `gold_user_activity` (ReplacingMergeTree)
+3. **Gold**: The Airflow DAG `gold_user_activity` runs daily, triggering `dbt run` which joins silver tables via ephemeral staging CTEs and appends aggregated results into `gold_user_activity` (ReplacingMergeTree). `dbt test` then validates data quality with `not_null` assertions
 
 ---
 
-## 10.5. Working with Airflow
+## 10.5. Working with Airflow and dbt
 
 ### Checking Airflow Pods
 
@@ -942,12 +944,28 @@ kubectl get pods -n airflow
 
 The scheduler and dag-processor are the critical components. The api-server (web UI) may crash due to CPU constraints on a single Kind node — this does not affect DAG execution.
 
+### How dbt Runs Inside Airflow
+
+dbt is baked into the custom Airflow image (`airflow-dbt:1.0`). The DAG `gold_user_activity` triggers dbt via two sequential BashOperator tasks:
+
+1. `dbt_run`: `cd /opt/airflow/dbt && dbt run --select gold_user_activity`
+2. `dbt_test`: `cd /opt/airflow/dbt && dbt test --select gold_user_activity`
+
+dbt connects to ClickHouse using environment variables set in `airflow-values.yaml`:
+
+| Env Var | Value |
+|---|---|
+| `DBT_CH_HOST` | `chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local` |
+| `DBT_CH_USER` | `airflow` |
+| `DBT_CH_PASSWORD` | `airflow123` |
+
 ### Testing the Gold DAG Manually
 
 ```bash
-# Run the DAG for a specific date (e.g., today)
-kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
-  bash -c "airflow tasks test gold_user_activity compute_gold_user_activity 2026-02-20 2>/dev/null"
+# Run the full DAG (dbt_run → dbt_test) for a specific date
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'
+# Expected: dbt_run PASS=1, dbt_test PASS=6, DagRun state: success
 ```
 
 Replace the date with whatever date has events in `events_silver`. Check available dates:
@@ -957,11 +975,45 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   --query "SELECT toDate(timestamp) AS d, count() FROM events_silver GROUP BY d"
 ```
 
+### Running dbt Directly Inside the Scheduler Pod
+
+For debugging, you can run dbt commands directly:
+
+```bash
+# dbt debug — verify connection to ClickHouse
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt debug'
+
+# dbt run — build the gold model
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt run --select gold_user_activity'
+
+# dbt test — run not_null assertions
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt test --select gold_user_activity'
+
+# dbt run --full-refresh — drop and recreate the gold table
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt run --full-refresh --select gold_user_activity'
+```
+
+### Running dbt Locally (Development)
+
+For local development, port-forward to ClickHouse and run dbt from your machine:
+
+```bash
+kubectl port-forward -n database pod/chi-chi-clickhouse-my-cluster-0-0-0 8123:8123 &
+cd dbt
+dbt debug          # verify connection (defaults to localhost:8123)
+dbt run            # build gold table
+dbt test           # run assertions
+```
+
 ### Listing Registered DAGs
 
 ```bash
-kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
-  bash -c "airflow dags list 2>/dev/null"
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags list 2>/dev/null'
 ```
 
 ### Updating the DAG Code
@@ -979,13 +1031,20 @@ kubectl rollout restart deployment airflow-dag-processor -n airflow
 kubectl rollout restart statefulset airflow-scheduler -n airflow
 ```
 
-### How the DAG Connects to ClickHouse
+### Updating dbt Models
 
-The DAG uses the ClickHouse HTTP interface (port 8123) via Python `requests`. It connects as the `airflow` user (password `airflow123`), which is allowed from any namespace. No extra pip packages are needed.
+dbt models are baked into the Airflow image. To update them:
 
-```
-URL:  http://chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local:8123/
-User: airflow / airflow123
+```bash
+# Rebuild the custom Airflow image
+docker build -f infrastructure/Dockerfile.airflow-dbt -t airflow-dbt:1.1 .
+kind load docker-image airflow-dbt:1.1 --name data-engineering-challenge
+
+# Update the image tag in airflow-values.yaml, then:
+helm upgrade airflow apache-airflow/airflow \
+  --namespace airflow \
+  --values infrastructure/airflow-values.yaml \
+  --timeout 10m
 ```
 
 ---
@@ -1273,6 +1332,7 @@ Alternatively, wrap the path in quotes inside the `--eval` string.
 kubectl get pods -n kafka                          # All Kafka components
 kubectl get pods -n database                       # All databases + ClickHouse
 kubectl get pods -n airflow                        # Airflow components
+kubectl get pods -n monitoring                     # Grafana
 kubectl get kafkaconnector -n kafka                # CDC connector health
 
 # == DATABASES ==
@@ -1307,16 +1367,26 @@ curl http://localhost:8083/                                       # Cluster info
 curl http://localhost:8083/connectors                            # List connectors
 curl http://localhost:8083/connectors/postgres-connector/status  # Connector status
 
-# == AIRFLOW ==
-kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
-  bash -c "airflow dags list 2>/dev/null"                       # List DAGs
+# == AIRFLOW + dbt ==
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags list 2>/dev/null'                       # List DAGs
 
-kubectl exec -n airflow deployment/airflow-dag-processor -c dag-processor -- \
-  bash -c "airflow tasks test gold_user_activity compute_gold_user_activity 2026-02-20 2>/dev/null"  # Test DAG
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'  # Test DAG (dbt run + test)
+
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt run --select gold_user_activity'   # Run dbt directly
+
+kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
+  bash -c 'cd /opt/airflow/dbt && dbt debug'                             # Test dbt connection
 
 # == RECOVERY ==
 kubectl delete pod -n kafka -l strimzi.io/kind=cluster-operator  # Unstick operator
 kubectl delete pod -n kafka my-connect-cluster-connect-0         # Restart Connect
+
+# == GRAFANA ==
+kubectl port-forward svc/grafana 3000:3000 -n monitoring             # Access Grafana
+# Open http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview  (admin / admin)
 
 # == LOGS ==
 kubectl logs pod/my-connect-cluster-connect-0 -n kafka --tail=50    # Connect logs

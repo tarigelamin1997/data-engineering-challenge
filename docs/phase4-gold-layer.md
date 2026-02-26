@@ -16,7 +16,14 @@ Kafka Topics
   postgres.public.users   ──► users_queue (Kafka Engine)  ──► mv_users ──► users_silver (ReplacingMergeTree)
   mongo.commerce.events   ──► events_queue (Kafka Engine) ──► mv_events ──► events_silver (MergeTree)
                                                                                     │
-                                                           Airflow DAG (daily) ──► gold_user_activity
+                                                   Airflow DAG (daily)              │
+                                                     ├─ dbt_run (BashOperator)  ────┘
+                                                     │    dbt run --select gold_user_activity
+                                                     └─ dbt_test (BashOperator)
+                                                          dbt test --select gold_user_activity
+                                                                    │
+                                                                    ▼
+                                                           gold_user_activity (ReplacingMergeTree)
 ```
 
 ---
@@ -27,7 +34,7 @@ Kafka Topics
 |---|---|---|---|
 | Altinity ClickHouse Operator | Deployment | kube-system | v0.24.x — manages ClickHouseInstallation CRs |
 | ClickHouse cluster | ClickHouseInstallation | database | 1 shard / 1 replica, image `clickhouse/clickhouse-server:24.8` |
-| Apache Airflow | Helm release `airflow` (chart 1.18.0) | airflow | Airflow 3.0.2, LocalExecutor, bundled PostgreSQL |
+| Apache Airflow | Helm release `airflow` (chart 1.18.0) | airflow | Airflow 3.0.2, LocalExecutor, custom image `airflow-dbt:1.0` (dbt-core + dbt-clickhouse baked in), bundled PostgreSQL |
 
 ---
 
@@ -94,10 +101,14 @@ ORDER BY (date, user_id);
 | File | Purpose |
 |---|---|
 | [infrastructure/clickhouse.yaml](../infrastructure/clickhouse.yaml) | ClickHouseInstallation CR — users, networking, storage |
-| [infrastructure/airflow-values.yaml](../infrastructure/airflow-values.yaml) | Airflow Helm chart values — executor, DAG mount, resources |
+| [infrastructure/airflow-values.yaml](../infrastructure/airflow-values.yaml) | Airflow Helm chart values — custom image, dbt env vars, DAG mount |
+| [infrastructure/Dockerfile.airflow-dbt](../infrastructure/Dockerfile.airflow-dbt) | Custom Airflow image: `apache/airflow:3.0.2` + dbt-core 1.11.6 + dbt-clickhouse 1.10.0 |
 | [scripts/create_tables.sql](../scripts/create_tables.sql) | Bronze + Silver schema (Kafka engine, MVs, silver tables) |
-| [scripts/create_gold.sql](../scripts/create_gold.sql) | Gold table definition |
-| [dags/gold_user_activity.py](../dags/gold_user_activity.py) | Airflow DAG — daily aggregation |
+| [scripts/create_gold.sql](../scripts/create_gold.sql) | Gold table DDL (initial creation — dbt manages this table after first `--full-refresh`) |
+| [dags/gold_user_activity.py](../dags/gold_user_activity.py) | Airflow DAG — BashOperator: `dbt run` → `dbt test` |
+| [dbt/dbt_project.yml](../dbt/dbt_project.yml) | dbt project config — staging=ephemeral, gold=incremental+append |
+| [dbt/profiles.yml](../dbt/profiles.yml) | ClickHouse connection profile (env_var defaults) |
+| [dbt/models/gold/gold_user_activity.sql](../dbt/models/gold/gold_user_activity.sql) | Incremental gold model with ReplacingMergeTree, append strategy |
 
 ---
 
@@ -110,44 +121,76 @@ ORDER BY (date, user_id);
 | Schedule | `@daily` (midnight UTC) |
 | Start date | 2026-02-18 |
 | Catchup | Disabled |
-| Task | `compute_gold_user_activity` (PythonOperator) |
+| Tasks | `dbt_run` → `dbt_test` (BashOperator chain) |
 | Retries | 2 (5-minute delay) |
 
 ### What the DAG does
 
-For the logical execution date `ds`, the task runs this ClickHouse query:
+The DAG runs two sequential BashOperator tasks inside the Airflow scheduler pod:
+
+1. **`dbt_run`**: Executes `cd /opt/airflow/dbt && dbt run --select gold_user_activity`
+   - Compiles the dbt model (staging CTEs + gold aggregation) and runs it against ClickHouse
+   - On first run: creates the `gold_user_activity` table with `ReplacingMergeTree(_updated_at)`
+   - On subsequent runs: appends new rows (incremental strategy = append)
+
+2. **`dbt_test`**: Executes `cd /opt/airflow/dbt && dbt test --select gold_user_activity`
+   - Runs `not_null` assertions on all gold table columns
+   - Fails the DAG if any test fails, providing data quality gating
+
+### dbt Model: gold_user_activity
+
+The gold model ([dbt/models/gold/gold_user_activity.sql](../dbt/models/gold/gold_user_activity.sql)) uses two ephemeral staging models as CTEs:
+
+- **stg_users**: `SELECT ... FROM users_silver FINAL WHERE is_deleted = 0` — deduplicates users
+- **stg_events**: `SELECT ... FROM events_silver` — passes through events
+
+The gold query joins these CTEs and aggregates per `(date, user_id)`:
 
 ```sql
-INSERT INTO gold_user_activity (date, user_id, full_name, email, total_events, last_event_at)
 SELECT
-    toDate(e.timestamp)        AS date,
+    toDate(e.timestamp) AS date,
     u.user_id,
-    anyLast(u.full_name)       AS full_name,
-    anyLast(u.email)           AS email,
-    count()                    AS total_events,
-    max(e.timestamp)           AS last_event_at
-FROM events_silver AS e
-INNER JOIN (
-    SELECT user_id, full_name, email
-    FROM   users_silver FINAL
-    WHERE  is_deleted = 0
-) AS u ON e.user_id = u.user_id
-WHERE toDate(e.timestamp) = toDate('<ds>')
-GROUP BY date, u.user_id;
+    anyLast(u.full_name) AS full_name,
+    anyLast(u.email) AS email,
+    count() AS total_events,
+    max(e.timestamp) AS last_event_at,
+    now() AS _updated_at
+FROM stg_events AS e
+INNER JOIN stg_users AS u ON e.user_id = u.user_id
+GROUP BY date, u.user_id
 ```
 
 **Why it's idempotent**: ClickHouse `ReplacingMergeTree` keeps the row with the highest `_updated_at` per `(date, user_id)`. Each re-run inserts fresh rows with `_updated_at = now()`, which supersede previous rows. Querying with `SELECT ... FROM gold_user_activity FINAL` always returns the most recent version.
 
-### ClickHouse Connection
+### Custom Airflow Image
 
-The DAG connects via the ClickHouse HTTP interface (port 8123) using the `requests` library — no extra pip packages needed.
+dbt is baked into the Airflow image (`airflow-dbt:1.0`) via [Dockerfile.airflow-dbt](../infrastructure/Dockerfile.airflow-dbt):
 
-```python
-CLICKHOUSE_URL  = "http://chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local:8123/"
-CLICKHOUSE_AUTH = {"user": "airflow", "password": "airflow123"}
+```dockerfile
+FROM apache/airflow:3.0.2
+USER root
+RUN mkdir -p /opt/airflow/dbt
+COPY dbt/ /opt/airflow/dbt/
+RUN chown -R airflow:root /opt/airflow/dbt
+USER airflow
+RUN pip install --no-cache-dir dbt-core==1.11.6 dbt-clickhouse==1.10.0
 ```
 
+### ClickHouse Connection
+
+dbt connects to ClickHouse via the HTTP interface (port 8123) using connection parameters from environment variables set in [airflow-values.yaml](../infrastructure/airflow-values.yaml):
+
+| Env Var | Value | Purpose |
+|---|---|---|
+| `DBT_CH_HOST` | `chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local` | In-cluster ClickHouse DNS |
+| `DBT_CH_USER` | `airflow` | ClickHouse user with cross-namespace access |
+| `DBT_CH_PASSWORD` | `airflow123` | ClickHouse password |
+
 The `airflow` ClickHouse user was created with `HOST ANY` to allow cross-namespace access from the `airflow` Kubernetes namespace. It is defined in `infrastructure/clickhouse.yaml` under `configuration.users` and injected via `configuration.files.users.d/zzz-airflow-access.xml` (which overrides the operator-generated network restrictions with `<networks replace="1">`).
+
+### Production Approach
+
+In production, replace BashOperator with `KubernetesPodOperator` running a dedicated dbt Docker image. This isolates dbt dependencies from the Airflow runtime and allows independent version management of dbt models without rebuilding the Airflow image.
 
 ---
 
@@ -196,11 +239,11 @@ Correct ClickHouse extraction:
 toDateTime(JSONExtract(JSONExtractRaw(after, 'ts'), '$date', 'Int64') / 1000)
 ```
 
-### 5. `airflow.operators.python` is deprecated in Airflow 3.x
+### 5. Airflow 3.x provider imports
 
-Import from `airflow.providers.standard.operators.python` instead:
+Airflow 3.x moved operators to `airflow.providers.standard`. The DAG uses:
 ```python
-from airflow.providers.standard.operators.python import PythonOperator
+from airflow.providers.standard.operators.bash import BashOperator
 ```
 
 ### 6. ClickHouse 23.8 Kafka Engine incompatible with Kafka 4.0.0 (RESOLVED)
@@ -244,9 +287,14 @@ kubectl exec -i -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
   clickhouse-client --user default --password "" --multiquery \
   < scripts/create_gold.sql
 
-# 7. Deploy Airflow
+# 7. Build custom Airflow image with dbt
+docker build -f infrastructure/Dockerfile.airflow-dbt -t airflow-dbt:1.0 .
+kind load docker-image airflow-dbt:1.0 --name data-engineering-challenge
+
+# 8. Deploy Airflow
 kubectl create namespace airflow
 kubectl create configmap airflow-dags -n airflow --from-file=dags/gold_user_activity.py
+helm repo add apache-airflow https://airflow.apache.org && helm repo update apache-airflow
 helm install airflow apache-airflow/airflow \
   --namespace airflow \
   --values infrastructure/airflow-values.yaml \
@@ -288,7 +336,8 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
   bash -c 'airflow dags list 2>/dev/null'
 
-# Test a DAG run
+# Test a DAG run (triggers dbt run + dbt test inside the scheduler pod)
 kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- \
-  bash -c 'airflow dags test gold_user_activity 2026-02-19 2>/dev/null | tail -5'
+  bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'
+# Expected: dbt_run PASS=1, dbt_test PASS=6, DagRun state: success
 ```
