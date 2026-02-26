@@ -173,8 +173,8 @@ Three layers of enforcement work together to prevent and recover from SLO breach
 
 | Item | Type | Detects | Threshold | Status | Priority |
 |------|------|---------|-----------|--------|----------|
-| Alert 1: Throughput Flatline | Grafana Alert | Connector crash / Kafka stall | < 1 event/min for 2 min | To Build | **Critical** |
-| Alert 2: Gold Layer Staleness | Grafana Alert | Airflow DAG missed / dbt run or test failed | staleness > 25 hours | To Build | **High** |
-| SLO 1: Silver Latency | SLO | Event ingestion delay | < 10 seconds (99th pct) | To Track | **Critical** |
+| Alert 1: Throughput Flatline | Grafana Alert | Connector crash / Kafka stall | < 1 event/min for 2 min | **Implemented** | **Critical** |
+| Alert 2: Gold Layer Staleness | Grafana Alert | Airflow DAG missed / dbt run or test failed | staleness > 25 hours | **Implemented** | **High** |
+| SLO 1: Silver Latency | SLO | Event ingestion delay | < 10 seconds (99th pct) | **Tracking** (Alert 1) | **Critical** |
 | SLO 2: Kafka Lag | SLO | Consumer lag buildup | < 5,000 messages | Needs Kafka metrics exposed | **High** |
-| SLO 3: Gold Freshness | SLO | Gold data staleness | < 25 hours (99.9th pct) | To Track | **High** |
+| SLO 3: Gold Freshness | SLO | Gold data staleness | < 25 hours (99.9th pct) | **Tracking** (Alert 2) | **High** |

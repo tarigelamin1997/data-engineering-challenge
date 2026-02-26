@@ -114,6 +114,35 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
      psql -U postgres -c "INSERT INTO users (full_name, email) VALUES ('Live Test', 'live@test.com');"
    ```
 
+5. **Alert rules are provisioned**:
+   ```bash
+   kubectl exec -n monitoring deployment/grafana -- \
+     curl -s http://admin:admin@localhost:3000/api/v1/provisioning/alert-rules
+   # Should return two rules: alert-throughput-flatline and alert-gold-staleness
+   ```
+
+6. **Alert rule health is OK**:
+   ```bash
+   kubectl exec -n monitoring deployment/grafana -- \
+     curl -s http://admin:admin@localhost:3000/api/prometheus/grafana/api/v1/rules
+   # Both rules should show "health":"ok" and "state":"inactive" (Normal)
+   ```
+
+7. **Alert rules visible in Grafana UI**: Open `http://localhost:3000/alerting/list` — both alerts should appear under the "CDC Pipeline" folder with their current state (Normal, Pending, or Firing).
+
+---
+
+## Alert Rules
+
+Two provisioned alert rules are deployed via `grafana-values.yaml`. They use Grafana's Unified Alerting with the ClickHouse datasource. No SMTP is configured on Kind — alerts are visible in the Grafana Alerting UI but no emails are sent.
+
+| Alert | Severity | Evaluates | Pending | Condition |
+|-------|----------|-----------|---------|-----------|
+| CDC Throughput Flatline | Critical | Every 1 min | 2 min | `count() FROM events_silver WHERE _ingested_at >= now() - 1 min` < 1 |
+| Gold Layer Staleness | High | Every 30 min | Immediate | `dateDiff('hour', max(last_event_at), now()) FROM gold_user_activity FINAL` > 25 |
+
+See [Planned Enhancements](planned-enhancements-alerts-slos.md) for full alert design rationale, SLO definitions, and first-response checklists.
+
 ---
 
 ## Troubleshooting
@@ -125,6 +154,8 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | Dashboard shows "No data" on time series | No events in selected time range | Change time range to "Last 7 days" or insert new data |
 | Gold panel empty | Airflow DAG hasn't run (dbt not triggered) | Run: `kubectl exec -n airflow airflow-scheduler-0 -c scheduler -- bash -c 'airflow dags test gold_user_activity 2026-02-26 2>/dev/null'` |
 | Port 3000 already in use | Another process on 3000 | Use a different local port: `kubectl port-forward svc/grafana 3001:3000 -n monitoring` |
+| Alert rules not showing in `/alerting/list` | `alerting` section missing from Helm values or Grafana pod not restarted | Re-run `helm upgrade` with latest `grafana-values.yaml`, wait for new pod |
+| Alert shows "Error" state | ClickHouse pod is down or query syntax error | Check ClickHouse: `kubectl get pods -n database`. Run the alert query manually in ClickHouse to verify. |
 
 ---
 
@@ -149,6 +180,13 @@ kubectl exec -n monitoring deployment/grafana -- \
 
 # Dashboard URL
 http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview
+
+# Alert rules URL
+http://localhost:3000/alerting/list
+
+# Check alert rule health
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s http://admin:admin@localhost:3000/api/prometheus/grafana/api/v1/rules
 
 # Credentials
 admin / admin

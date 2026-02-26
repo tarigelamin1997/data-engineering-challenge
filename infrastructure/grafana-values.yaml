@@ -76,3 +76,124 @@ grafana.ini:
   log:
     mode: console
     level: warn
+  unified_alerting:
+    enabled: true
+  alerting:
+    enabled: false
+
+# ── Alert Rules (Unified Alerting) ─────────────────────────────────────────
+# Two provisioned alert rules. Contact point: Grafana's default (no SMTP on
+# Kind — alerts are visible in the Alerting UI but no emails are sent).
+alerting:
+  rules.yaml:
+    apiVersion: 1
+    groups:
+      # ── Alert 1: CDC Throughput Flatline (Critical) ──────────────────────
+      # Fires when zero events reach events_silver for 2+ consecutive minutes.
+      # Detects: Debezium crash, Kafka consumer stall, ClickHouse MV failure.
+      # Enforces SLO 1 (Silver Layer Latency).
+      - orgId: 1
+        name: cdc-throughput-alerts
+        folder: "CDC Pipeline"
+        interval: 1m
+        rules:
+          - uid: alert-throughput-flatline
+            title: "CDC Throughput Flatline"
+            condition: threshold
+            for: 2m
+            labels:
+              severity: critical
+            annotations:
+              summary: "CDC event throughput has dropped to zero"
+              description: >-
+                No events have been ingested into events_silver for at least 2
+                consecutive minutes. This indicates a Debezium connector crash,
+                Kafka consumer stall, or ClickHouse Materialized View failure.
+                First response: kubectl get pods -n kafka -n database, check
+                connector READY status, check kafka-connect logs for ERROR.
+            data:
+              - refId: A
+                datasourceUid: clickhouse
+                relativeTimeRange:
+                  from: 60
+                  to: 0
+                model:
+                  rawSql: "SELECT count() AS value FROM events_silver WHERE _ingested_at >= now() - INTERVAL 1 MINUTE"
+                  format: 2
+                  queryType: sql
+                  editorType: sql
+              - refId: threshold
+                datasourceUid: "__expr__"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                model:
+                  type: threshold
+                  expression: A
+                  conditions:
+                    - evaluator:
+                        type: lt
+                        params:
+                          - 1
+                      operator:
+                        type: and
+                      query:
+                        params:
+                          - A
+                      reducer:
+                        type: last
+
+      # ── Alert 2: Gold Layer Staleness (High) ─────────────────────────────
+      # Fires when gold_user_activity hasn't been updated in >25 hours.
+      # Detects: Airflow DAG missed, dbt run/test failure.
+      # Enforces SLO 3 (Gold Layer Freshness).
+      - orgId: 1
+        name: cdc-freshness-alerts
+        folder: "CDC Pipeline"
+        interval: 30m
+        rules:
+          - uid: alert-gold-staleness
+            title: "Gold Layer Staleness"
+            condition: threshold
+            for: 0s
+            labels:
+              severity: high
+            annotations:
+              summary: "Gold user activity table is stale (>25 hours)"
+              description: >-
+                The gold_user_activity table has not been updated in over 25
+                hours. The Airflow DAG gold_user_activity may have failed, or
+                dbt run/test may have errored. First response: kubectl get pods
+                -n airflow, check Airflow UI DAG run history, run dbt debug
+                and dbt run manually from the scheduler pod.
+            data:
+              - refId: A
+                datasourceUid: clickhouse
+                relativeTimeRange:
+                  from: 86400
+                  to: 0
+                model:
+                  rawSql: "SELECT dateDiff('hour', max(last_event_at), now()) AS value FROM gold_user_activity FINAL"
+                  format: 2
+                  queryType: sql
+                  editorType: sql
+              - refId: threshold
+                datasourceUid: "__expr__"
+                relativeTimeRange:
+                  from: 0
+                  to: 0
+                model:
+                  type: threshold
+                  expression: A
+                  conditions:
+                    - evaluator:
+                        type: gt
+                        params:
+                          - 25
+                      operator:
+                        type: and
+                      query:
+                        params:
+                          - A
+                      reducer:
+                        type: last
