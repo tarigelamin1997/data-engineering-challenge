@@ -2,7 +2,20 @@
 # Chart: apache-airflow/airflow (Airflow 3.x)
 # Executor: LocalExecutor (no Redis/Celery overhead for a single-node Kind cluster)
 
+# Custom image with dbt-core + dbt-clickhouse pre-installed
+defaultAirflowRepository: airflow-dbt
+defaultAirflowTag: "1.0"
+
 executor: LocalExecutor
+
+# dbt ClickHouse connection (in-cluster DNS, consumed by profiles.yml env_var())
+env:
+  - name: DBT_CH_HOST
+    value: "chi-chi-clickhouse-my-cluster-0-0.database.svc.cluster.local"
+  - name: DBT_CH_USER
+    value: "airflow"
+  - name: DBT_CH_PASSWORD
+    value: "airflow123"
 
 # Minimal resource requests so Kind doesn't OOM
 scheduler:

@@ -1,0 +1,9 @@
+FROM apache/airflow:3.0.2
+
+USER root
+RUN mkdir -p /opt/airflow/dbt
+COPY dbt/ /opt/airflow/dbt/
+RUN chown -R airflow:root /opt/airflow/dbt
+
+USER airflow
+RUN pip install --no-cache-dir --retries 5 --timeout 120 dbt-core==1.11.6 dbt-clickhouse==1.10.0
