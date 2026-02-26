@@ -13,6 +13,8 @@
 
 The current Grafana dashboard (CDC Pipeline Overview) provides 5 panels with 30-second auto-refresh and a native ClickHouse datasource. It offers visibility but no automated alerting — a human must be watching for problems to be caught. In production, this is insufficient.
 
+The gold layer is now managed by **dbt** (dbt-core 1.11.6 + dbt-clickhouse 1.10.0), baked into a custom Airflow image. The Airflow DAG runs two sequential BashOperator tasks: `dbt run` (incremental model build) → `dbt test` (6 `not_null` assertions). A dbt failure is silent from Grafana's perspective — the gold table simply stops refreshing.
+
 These two alert rules are the minimum required to detect the two most critical silent failure modes: **data flow stopping** and the **gold layer going stale**.
 
 ---
@@ -148,7 +150,7 @@ These three SLOs define the production commitments for the CDC pipeline. Each th
 | Parameter | Value |
 |-----------|-------|
 | **Commitment** | **Gold tables reflect data no older than 25 hours, 99.9% of the time** |
-| **Evidence** | The `gold_user_activity` Airflow DAG runs once per day. 25 hours = 24-hour schedule + 1-hour execution buffer for CPU contention on a shared Kind node. |
+| **Evidence** | The `gold_user_activity` Airflow DAG runs once per day. It executes `dbt run` (~1.3s for the incremental model) followed by `dbt test` (~20s for 6 `not_null` assertions). 25 hours = 24-hour schedule + 1-hour execution buffer for CPU contention on a shared Kind node. dbt execution time (~22s total) is negligible relative to the 1-hour buffer. |
 | **Measured by** | `SELECT dateDiff('hour', max(last_event_at), now()) AS staleness_hours FROM gold_user_activity FINAL` |
 | **Breach indicator** | Gold Layer Staleness alert fires (`staleness_hours > 25`) — enforced by Alert 2 |
 | **Error budget** | 0.1% violation allowed — ~8.76 hours per year of gold layer staleness beyond 25 hours |
@@ -161,7 +163,8 @@ These three SLOs define the production commitments for the CDC pipeline. Each th
 Three layers of enforcement work together to prevent and recover from SLO breaches:
 
 - **Layer 1 — Reactive alerting**: Alert 1 (Throughput Flatline) enforces SLO 1. Alert 2 (Gold Layer Staleness) enforces SLO 3. SLO 2 requires a third alert once Kafka metrics are exposed to Grafana.
-- **Layer 2 — Automatic recovery**: Kubernetes restarts crashed pods. Strimzi reconciles failed KafkaConnector CRs back to RUNNING state. Most failure modes self-heal without manual intervention, limiting breach duration.
+- **Layer 1.5 — dbt test as data quality gate**: The `dbt_test` task runs 6 `not_null` assertions on the gold table after every `dbt_run`. If any assertion fails, the Airflow task fails and the DAG is marked as failed — providing an early signal before the staleness alert threshold is reached. This catches data quality issues (e.g., null user_id from a broken CDC schema change) that would otherwise only surface when downstream consumers query bad data.
+- **Layer 2 — Automatic recovery**: Kubernetes restarts crashed pods. Strimzi reconciles failed KafkaConnector CRs back to RUNNING state. Airflow retries failed DAG tasks (2 retries, 5-minute delay). Most failure modes self-heal without manual intervention, limiting breach duration.
 - **Layer 3 — Error budget tracking (production)**: Track consumption of the 1% / 0.1% error budgets weekly. If budget burns faster than expected, freeze deployments and investigate root cause before the budget is exhausted. This follows Google SRE methodology — not yet implemented on Kind cluster.
 
 ---
@@ -171,7 +174,7 @@ Three layers of enforcement work together to prevent and recover from SLO breach
 | Item | Type | Detects | Threshold | Status | Priority |
 |------|------|---------|-----------|--------|----------|
 | Alert 1: Throughput Flatline | Grafana Alert | Connector crash / Kafka stall | < 1 event/min for 2 min | To Build | **Critical** |
-| Alert 2: Gold Layer Staleness | Grafana Alert | Airflow DAG missed / failed | staleness > 25 hours | To Build | **High** |
+| Alert 2: Gold Layer Staleness | Grafana Alert | Airflow DAG missed / dbt run or test failed | staleness > 25 hours | To Build | **High** |
 | SLO 1: Silver Latency | SLO | Event ingestion delay | < 10 seconds (99th pct) | To Track | **Critical** |
 | SLO 2: Kafka Lag | SLO | Consumer lag buildup | < 5,000 messages | Needs Kafka metrics exposed | **High** |
 | SLO 3: Gold Freshness | SLO | Gold data staleness | < 25 hours (99.9th pct) | To Track | **High** |
