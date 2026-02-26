@@ -1,5 +1,7 @@
 # Phase 4: Gold Layer — ClickHouse + Airflow
 
+> **See also**: [Phase 4b — dbt Integration](phase4b-dbt-integration.md) for the full dbt project structure, materialization strategy, custom Airflow image, and deployment steps.
+
 ## Objective
 
 Deploy the analytical storage layer (ClickHouse) and the orchestration layer (Airflow) to:
