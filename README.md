@@ -207,6 +207,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 │   ├── phase5-stress-test-methodology.md  # Stress test design and rationale
 │   ├── phase5-stress-test-results.md      # Stress test results and outcomes
 │   ├── phase6-grafana-dashboard.md        # Grafana deployment and dashboard guide
+│   ├── planned-enhancements-alerts-slos.md # Alert rules, SLOs, and production roadmap
 │   ├── how-to-test-and-operate.md  # Operations manual and troubleshooting
 │   ├── 01-Logical-Data-Flow-Architecture.png
 │   ├── 02-Physical-Kubernetes-Architecture-Self-Hosted.png
@@ -227,6 +228,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | [Phase 5 — Stress Test Methodology](docs/phase5-stress-test-methodology.md) | Test design, CPU budget analysis, 8 progressive wave rationale |
 | [Phase 5 — Stress Test Results](docs/phase5-stress-test-results.md) | Results: 25K rows at 4,166–6,250 rows/s with sub-linear latency |
 | [Phase 6 — Grafana Dashboard](docs/phase6-grafana-dashboard.md) | Live observability dashboard with ClickHouse datasource |
+| [Planned Enhancements](docs/planned-enhancements-alerts-slos.md) | Alert rules, SLO definitions, and production roadmap |
 
 ## Status
 
@@ -238,3 +240,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | 4 | ClickHouse ingestion + Airflow gold DAG | Done |
 | 5 | Stress testing (methodology + automated script) | Done |
 | 6 | Grafana observability dashboard | Done |
+
+## Known Gaps & Next Steps
+
+See [Planned Enhancements](docs/planned-enhancements-alerts-slos.md) — covers Grafana alert rules, SLO definitions, and Kafka lag monitoring. Deliberately deferred: SLO 2 requires Prometheus deployment; cost/benefit doesn't justify added infrastructure complexity on a single-node Kind cluster. On managed Kafka (AWS MSK), consumer lag is a built-in CloudWatch metric — no exporter needed.
