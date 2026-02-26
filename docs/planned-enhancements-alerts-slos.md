@@ -1,21 +1,22 @@
-# CDC Pipeline — Planned Enhancements
+# CDC Pipeline — Alerts, SLOs & Observability
 
-> Grafana Alert Rules + SLO Definitions — To implement post-interview prep
+> Grafana Alert Rules + SLO Definitions for the CDC Pipeline
 
 | Field | Value |
 |-------|-------|
 | **Date** | February 2026 |
 | **Project** | CDC Pipeline — Kind/K8s (Debezium → Kafka → ClickHouse) |
-| **Priority** | High — known gap acknowledged during interview prep |
 | **Dashboard** | `http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview` |
+| **Alert rules** | `http://localhost:3000/alerting/list` |
+| **Provisioned via** | `infrastructure/grafana-values.yaml` → `alerting.rules.yaml` |
 
 ## Context
 
-The current Grafana dashboard (CDC Pipeline Overview) provides 5 panels with 30-second auto-refresh and a native ClickHouse datasource. It offers visibility but no automated alerting — a human must be watching for problems to be caught. In production, this is insufficient.
+The Grafana dashboard (CDC Pipeline Overview) provides 5 panels with 30-second auto-refresh and a native ClickHouse datasource. Two **provisioned alert rules** detect the two most critical silent failure modes: **data flow stopping** and the **gold layer going stale**.
 
-The gold layer is now managed by **dbt** (dbt-core 1.11.6 + dbt-clickhouse 1.10.0), baked into a custom Airflow image. The Airflow DAG runs two sequential BashOperator tasks: `dbt run` (incremental model build) → `dbt test` (6 `not_null` assertions). A dbt failure is silent from Grafana's perspective — the gold table simply stops refreshing.
+The gold layer is managed by **dbt** (dbt-core 1.11.6 + dbt-clickhouse 1.10.0), baked into a custom Airflow image. The Airflow DAG runs two sequential BashOperator tasks: `dbt run` (incremental model build) → `dbt test` (6 `not_null` assertions). A dbt failure is silent from Grafana's perspective — the gold table simply stops refreshing, which Alert 2 detects.
 
-These two alert rules are the minimum required to detect the two most critical silent failure modes: **data flow stopping** and the **gold layer going stale**.
+Alert rules are deployed via Grafana's Unified Alerting file-based provisioning in `grafana-values.yaml`. On the Kind cluster, alerts are visible in the Grafana Alerting UI (`/alerting/list`) but no emails are sent (no SMTP configured). In production, alerts would route to PagerDuty / Slack via contact points.
 
 ---
 
@@ -31,17 +32,19 @@ The events-per-minute time series drops to zero for 2 or more consecutive minute
 
 This is the most critical alert. Data stops flowing silently — no errors are thrown, no pods crash — and without this alert you would only discover the problem when someone queries stale data downstream.
 
-### Implementation
+### Implementation — Deployed
 
 | Parameter | Value |
 |-----------|-------|
-| **Alert name** | CDC Throughput Flatline |
-| **Panel** | CDC Throughput — Events/min |
-| **Condition** | `avg()` of query IS BELOW 1 for 2 minutes |
+| **Alert UID** | `alert-throughput-flatline` |
+| **Rule group** | `cdc-throughput-alerts` (folder: CDC Pipeline) |
+| **Condition** | `last()` of query A IS BELOW 1 |
 | **Evaluate every** | 1 minute |
-| **Pending period** | 2 minutes (avoids false positives during idle periods) |
-| **Severity** | **Critical** |
-| **Underlying query** | `SELECT count() FROM events_silver WHERE _ingested_at >= now() - INTERVAL 1 MINUTE` |
+| **Pending period (`for`)** | 2 minutes (must be below threshold for 2 consecutive evaluations) |
+| **Severity label** | `critical` |
+| **Query A** | `SELECT count() AS value FROM events_silver WHERE _ingested_at >= now() - INTERVAL 1 MINUTE` |
+| **Threshold** | Grafana `__expr__` evaluator: `lt 1` on query A result |
+| **Provisioned in** | `infrastructure/grafana-values.yaml` → `alerting.rules.yaml` |
 
 ### Why the 2-Minute Threshold
 
@@ -68,17 +71,19 @@ The `gold_user_activity` table has not been updated in more than 25 hours. Since
 
 This alert catches a silent Airflow DAG or dbt failure. Unlike a connector crash (which may produce errors), a failed dbt run often leaves no visible signal in Grafana — the gold layer simply stops refreshing. Business users querying aggregated user activity would see stale numbers with no warning. Since dbt is now triggered by Airflow's `gold_user_activity` DAG (via BashOperator), both DAG scheduling failures and dbt model failures are caught by this alert.
 
-### Implementation
+### Implementation — Deployed
 
 | Parameter | Value |
 |-----------|-------|
-| **Alert name** | Gold Layer Staleness |
-| **Panel** | Gold Layer Summary (table panel) |
-| **Condition** | `avg()` of `staleness_hours` IS ABOVE 25 |
+| **Alert UID** | `alert-gold-staleness` |
+| **Rule group** | `cdc-freshness-alerts` (folder: CDC Pipeline) |
+| **Condition** | `last()` of query A IS ABOVE 25 |
 | **Evaluate every** | 30 minutes |
-| **Pending period** | 0 minutes (fire immediately when threshold crossed) |
-| **Severity** | **High** |
-| **Staleness query** | `SELECT dateDiff('hour', max(last_event_at), now()) AS staleness_hours FROM gold_user_activity FINAL` |
+| **Pending period (`for`)** | 0s (fire immediately when threshold crossed) |
+| **Severity label** | `high` |
+| **Query A** | `SELECT dateDiff('hour', max(last_event_at), now()) AS value FROM gold_user_activity FINAL` |
+| **Threshold** | Grafana `__expr__` evaluator: `gt 25` on query A result |
+| **Provisioned in** | `infrastructure/grafana-values.yaml` → `alerting.rules.yaml` |
 
 ### Why the 25-Hour Threshold
 
@@ -94,9 +99,11 @@ The Airflow DAG `gold_user_activity` runs once per day. A 24-hour threshold woul
 
 ---
 
-## Notification Channels (Production)
+## Notification Channels
 
-> **Gap in current implementation**: The alerts above define *what* to detect but not *where* to send notifications. In production, alerts firing to nowhere aren't alerts.
+**Current state (Kind cluster)**: Both alerts are provisioned and evaluating. Alert state transitions (Normal → Pending → Firing → Resolved) are visible in the Grafana Alerting UI at `/alerting/list`. No external notifications are sent — no SMTP or webhook is configured. This is sufficient for a development environment.
+
+**Production routing**: In production, add contact points to `grafana-values.yaml` to route alerts externally:
 
 | Severity | Channel | Routing |
 |----------|---------|---------|
@@ -104,15 +111,15 @@ The Airflow DAG `gold_user_activity` runs once per day. A 24-hour threshold woul
 | **High** | Slack `#data-alerts` + email | Investigate within 1 hour |
 | **Warning** | Slack `#data-alerts` | Review during business hours |
 
-On a Kind cluster, Grafana can use its built-in email or webhook contact points. In production on cloud infrastructure, integrate with the organization's existing incident management tooling.
+On cloud infrastructure, integrate with the organization's existing incident management tooling. Grafana supports PagerDuty, Slack, OpsGenie, webhook, and email contact points natively.
 
 ---
 
 ## Interview Framing
 
-When asked about monitoring in interviews, acknowledge this gap and explain the fix:
+When asked about monitoring in interviews:
 
-> *"My current implementation has dashboards but no alerting rules — that's a known gap. In production I'd add two alerts: a throughput flatline detector for connector failures with a 2-minute pending period to avoid false positives, and a gold layer staleness alert with a 25-hour threshold to catch missed Airflow DAG runs. The throughput alert is higher priority because silent data loss is worse than a stale aggregate — at least a stale aggregate is still correct for the time it covers."*
+> *"I have two provisioned Grafana alert rules deployed via Helm values. The first is a throughput flatline detector — it queries events_silver every minute and fires after 2 minutes of zero ingest, catching silent connector crashes. The second is a gold layer staleness alert — it checks the age of gold_user_activity every 30 minutes and fires if the table hasn't been refreshed in 25 hours, catching failed Airflow DAG runs or dbt errors. Both are provisioned as code in grafana-values.yaml, so they survive pod restarts. The one gap is Kafka consumer lag — that requires exposing JMX metrics, which on AWS MSK is a built-in CloudWatch metric, no exporter needed."*
 
 When asked about the transformation layer:
 
@@ -162,14 +169,14 @@ These three SLOs define the production commitments for the CDC pipeline. Each th
 
 Three layers of enforcement work together to prevent and recover from SLO breaches:
 
-- **Layer 1 — Reactive alerting**: Alert 1 (Throughput Flatline) enforces SLO 1. Alert 2 (Gold Layer Staleness) enforces SLO 3. SLO 2 requires a third alert once Kafka metrics are exposed to Grafana.
+- **Layer 1 — Reactive alerting (deployed)**: Alert 1 (Throughput Flatline, `alert-throughput-flatline`) enforces SLO 1. Alert 2 (Gold Layer Staleness, `alert-gold-staleness`) enforces SLO 3. Both are provisioned in `grafana-values.yaml`. SLO 2 requires a third alert once Kafka metrics are exposed to Grafana.
 - **Layer 1.5 — dbt test as data quality gate**: The `dbt_test` task runs 6 `not_null` assertions on the gold table after every `dbt_run`. If any assertion fails, the Airflow task fails and the DAG is marked as failed — providing an early signal before the staleness alert threshold is reached. This catches data quality issues (e.g., null user_id from a broken CDC schema change) that would otherwise only surface when downstream consumers query bad data.
 - **Layer 2 — Automatic recovery**: Kubernetes restarts crashed pods. Strimzi reconciles failed KafkaConnector CRs back to RUNNING state. Airflow retries failed DAG tasks (2 retries, 5-minute delay). Most failure modes self-heal without manual intervention, limiting breach duration.
 - **Layer 3 — Error budget tracking (production)**: Track consumption of the 1% / 0.1% error budgets weekly. If budget burns faster than expected, freeze deployments and investigate root cause before the budget is exhausted. This follows Google SRE methodology — not yet implemented on Kind cluster.
 
 ---
 
-## Summary — All Planned Enhancements
+## Summary — Alerts & SLO Status
 
 | Item | Type | Detects | Threshold | Status | Priority |
 |------|------|---------|-----------|--------|----------|
