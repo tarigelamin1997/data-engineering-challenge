@@ -7,14 +7,20 @@ A production-grade CDC data pipeline running on local Kubernetes (Kind). Changes
 **Pipeline Architecture**:
 
 ```
-PostgreSQL (users)  ──┐                                                    ┌─────────────────────┐
-                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ─┤  Airflow (dbt)      │
-MongoDB (events)    ──┘                                         (Silver)   │  BashOperator       │
-                                                                           │  dbt run → dbt test │
-                                                                           └─────────┬───────────┘
-                                                                                     ▼
-                                                                              gold_user_activity
-                                                                              (Gold Layer)
+                                                                           ┌─────────────────────┐
+PostgreSQL (users)  ──┐                                                    │  Airflow (dbt)      │
+                      ├── Debezium/Kafka Connect ──► Kafka ──► ClickHouse ─┤  dbt run → dbt test │
+MongoDB (events)    ──┘                                         (Silver)   │         │           │
+                                                                           │         ▼           │
+                                                                           │  gold_user_activity │
+                                                                           └─────────────────────┘
+                                                                                     │
+                                                                           ┌─────────▼───────────┐
+                                                                           │  Grafana            │
+                                                                           │  5 dashboard panels │
+                                                                           │  2 alert rules      │
+                                                                           │  3 SLO definitions  │
+                                                                           └─────────────────────┘
 ```
 
 ## Tech Stack
@@ -26,7 +32,7 @@ MongoDB (events)    ──┘                                         (Silver)  
 | Analytics | [ClickHouse](https://clickhouse.com/) 24.8 via [Altinity Operator](https://github.com/Altinity/clickhouse-operator) |
 | Transformation | [dbt](https://www.getdbt.com/) 1.11 + [dbt-clickhouse](https://github.com/ClickHouse/dbt-clickhouse) adapter |
 | Orchestration | [Apache Airflow](https://airflow.apache.org/) 3.0.2 (custom image with dbt baked in) |
-| Observability | [Grafana](https://grafana.com/) with native ClickHouse plugin |
+| Observability | [Grafana](https://grafana.com/) with native ClickHouse plugin + Unified Alerting |
 
 ## Prerequisites
 
@@ -186,6 +192,11 @@ kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
 # Grafana dashboard
 kubectl port-forward svc/grafana 3000:3000 -n monitoring
 # Open http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview
+
+# Both alert rules provisioned and evaluating
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s http://admin:admin@localhost:3000/api/v1/provisioning/alert-rules
+# Alert rules visible at http://localhost:3000/alerting/list
 ```
 
 ## Repository Structure
@@ -205,7 +216,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 │   ├── clickhouse.yaml             # ClickHouse cluster (Altinity CHI)
 │   ├── Dockerfile.airflow-dbt       # Custom Airflow image (Airflow 3.0.2 + dbt-core + dbt-clickhouse)
 │   ├── airflow-values.yaml         # Airflow Helm chart values (custom image, dbt env vars)
-│   ├── grafana-values.yaml         # Grafana Helm chart values
+│   ├── grafana-values.yaml         # Grafana Helm chart values + 2 provisioned alert rules
 │   └── grafana-dashboard-configmap.yaml  # Grafana dashboard JSON (5 panels)
 ├── scripts/
 │   ├── seed_postgres.sql           # Creates and seeds the users table
@@ -234,7 +245,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 │   ├── phase5-stress-test-methodology.md  # Stress test design and rationale
 │   ├── phase5-stress-test-results.md      # Stress test results and outcomes
 │   ├── phase6-grafana-dashboard.md        # Grafana deployment and dashboard guide
-│   ├── planned-enhancements-alerts-slos.md # Alert rules, SLOs, and production roadmap
+│   ├── phase7-alerts-slos.md              # Alert rules, SLO definitions, verification results
 │   ├── how-to-test-and-operate.md  # Operations manual and troubleshooting
 │   ├── 01-Logical-Data-Flow-Architecture.png
 │   ├── 02-Physical-Kubernetes-Architecture-Self-Hosted.png
@@ -256,7 +267,7 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 | [Phase 5 — Stress Test Methodology](docs/phase5-stress-test-methodology.md) | Test design, CPU budget analysis, 8 progressive wave rationale |
 | [Phase 5 — Stress Test Results](docs/phase5-stress-test-results.md) | Results: 25K rows at 4,166–6,250 rows/s with sub-linear latency |
 | [Phase 6 — Grafana Dashboard](docs/phase6-grafana-dashboard.md) | Live observability dashboard with ClickHouse datasource |
-| [Planned Enhancements](docs/planned-enhancements-alerts-slos.md) | Alert rules, SLO definitions, and production roadmap |
+| [Phase 7 — Alerts, SLOs & Observability](docs/phase7-alerts-slos.md) | 2 alert rules (verified), 3 SLO definitions, enforcement mechanism |
 
 ## Status
 
@@ -264,10 +275,12 @@ kubectl port-forward svc/grafana 3000:3000 -n monitoring
 |---|---|---|
 | 1 | Environment setup (Kind, Strimzi, databases) | Done |
 | 2 | Kafka cluster (KRaft mode) + Connect image | Done |
-| 3 | CDC pipeline (Kafka Connect + Debezium) | Done |
-| 4 | ClickHouse ingestion + Airflow gold DAG | Done |
-| 5 | Stress testing (methodology + automated script) | Done |
-| 6 | Grafana observability dashboard | Done |
+| 3 | CDC pipeline (Debezium connectors, Postgres + MongoDB) | Done |
+| 4 | ClickHouse ingestion + gold layer + dbt integration | Done |
+| 5 | Stress testing (8 progressive waves, 25K rows peak) | Done |
+| 6 | Grafana dashboard (5 panels, auto-refresh, ClickHouse datasource) | Done |
+| 7 | Alert rules (2 provisioned as code, Alert 1 verified end-to-end) | Done |
+| 8 | SLO definitions (3 SLOs, 2 actively tracked via alerts) | Done |
 
 ## dbt Transformation Layer
 
@@ -313,6 +326,28 @@ dbt test           # run not_null assertions
 - **No `unique` tests**: ClickHouse only deduplicates on merge/FINAL, so uniqueness tests would produce false failures
 - **Production path**: replace BashOperator with KubernetesPodOperator running a dedicated dbt Docker image — isolates dbt dependencies from the Airflow runtime
 
-## Known Gaps & Next Steps
+## Observability & Alerting
 
-See [Planned Enhancements](docs/planned-enhancements-alerts-slos.md) — covers Grafana alert rules, SLO definitions, and Kafka lag monitoring. Deliberately deferred: SLO 2 requires Prometheus deployment; cost/benefit doesn't justify added infrastructure complexity on a single-node Kind cluster. On managed Kafka (AWS MSK), consumer lag is a built-in CloudWatch metric — no exporter needed.
+Two alert rules are provisioned as code in `grafana-values.yaml` using Grafana Unified Alerting. They survive pod restarts and full cluster redeployment — no Grafana persistence needed.
+
+| Alert | Severity | Condition | Status |
+|---|---|---|---|
+| CDC Throughput Flatline | Critical | < 1 event/min for 2 consecutive minutes | **Verified** (end-to-end lifecycle test) |
+| Gold Layer Staleness | High | Gold table not refreshed in > 25 hours | **Implemented** (query validated) |
+
+Three SLOs are defined with thresholds derived from stress test results:
+
+| SLO | Commitment | Tracked By |
+|---|---|---|
+| Silver Latency | 99% of events reach ClickHouse in < 10s | Alert 1 |
+| Kafka Consumer Lag | < 5,000 messages 99% of the time | *Not yet tracked — see below* |
+| Gold Freshness | Gold tables < 25 hours old 99.9% of the time | Alert 2 |
+
+See [Phase 7 — Alerts, SLOs & Observability](docs/phase7-alerts-slos.md) for full alert design, SLO evidence, enforcement mechanism, and verification results.
+
+## Known Gaps
+
+Two items are deliberately deferred — cost/benefit doesn't justify added infrastructure complexity on a single-node Kind cluster:
+
+- **SLO 2 (Kafka Consumer Lag)**: Requires Kafka metrics exposed to Grafana via Kafka Exporter or Strimzi Prometheus metrics. On managed Kafka (AWS MSK), consumer lag is a built-in CloudWatch metric (`SumOffsetLag`) — no exporter needed.
+- **Production notification channels**: Alerts are visible in the Grafana UI on Kind but no emails or pages are sent (no SMTP/webhook configured). In production, add PagerDuty (critical) and Slack (high) contact points to `grafana-values.yaml`.

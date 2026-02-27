@@ -141,7 +141,7 @@ Two provisioned alert rules are deployed via `grafana-values.yaml`. They use Gra
 | CDC Throughput Flatline | Critical | Every 1 min | 2 min | `count() FROM events_silver WHERE _ingested_at >= now() - 1 min` < 1 |
 | Gold Layer Staleness | High | Every 30 min | Immediate | `dateDiff('hour', max(last_event_at), now()) FROM gold_user_activity FINAL` > 25 |
 
-See [Planned Enhancements](planned-enhancements-alerts-slos.md) for full alert design rationale, SLO definitions, and first-response checklists.
+See [Phase 7 — Alerts, SLOs & Observability](phase7-alerts-slos.md) for full alert design rationale, SLO definitions, verification results, and first-response checklists.
 
 ---
 
