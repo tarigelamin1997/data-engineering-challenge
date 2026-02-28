@@ -17,6 +17,7 @@ This guide explains everything about how the CDC data pipeline works and how to 
 9. [Testing the CDC Pipeline End-to-End](#9-testing-the-cdc-pipeline-end-to-end)
 10. [Working with ClickHouse](#10-working-with-clickhouse)
 10.5. [Working with Airflow and dbt](#105-working-with-airflow-and-dbt)
+10.6. [Working with Grafana Alerts](#106-working-with-grafana-alerts)
 11. [Common Operational Tasks](#11-common-operational-tasks)
 12. [Troubleshooting Guide](#12-troubleshooting-guide)
 
@@ -1049,6 +1050,90 @@ helm upgrade airflow apache-airflow/airflow \
 
 ---
 
+## 10.6. Working with Grafana Alerts
+
+Two alert rules are provisioned as code in `grafana-values.yaml`. They load automatically at Grafana startup — no manual UI configuration required.
+
+| Alert | Severity | Fires When | Evaluate | Pending |
+|-------|----------|-----------|----------|---------|
+| CDC Throughput Flatline | Critical | < 1 event/min in `events_silver` | Every 1m | 2m |
+| Gold Layer Staleness | High | Gold table > 25 hours stale | Every 30m | Immediate |
+
+### Checking Alert Status
+
+```bash
+# View alert rules in the Grafana UI
+kubectl port-forward svc/grafana 3000:3000 -n monitoring
+# Open http://localhost:3000/alerting/list  (admin / admin)
+
+# Check alert rules via API (from inside the cluster)
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s http://admin:admin@localhost:3000/api/v1/provisioning/alert-rules
+
+# Check which alerts are currently firing
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s "http://admin:admin@localhost:3000/api/alertmanager/grafana/api/v2/alerts"
+# Returns [] if no alerts are firing (Normal state)
+
+# Check rule evaluation state (includes Normal, Pending, Alerting)
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s "http://admin:admin@localhost:3000/api/prometheus/grafana/api/v1/rules"
+```
+
+### Alert State Lifecycle
+
+Grafana Unified Alerting uses three states:
+
+- **Normal** — condition not met, everything healthy
+- **Pending** — condition met but `for` period not yet elapsed (Alert 1 only, 2 minutes)
+- **Firing** — condition met for the full pending period, alert is active
+
+### Testing Alert 1 (Throughput Flatline)
+
+Alert 1 fires when zero events arrive in `events_silver` for 2 consecutive minutes. To test the full lifecycle:
+
+```bash
+# 1. Check current state (should be Firing if pipeline is idle, Normal if data is flowing)
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s "http://admin:admin@localhost:3000/api/alertmanager/grafana/api/v2/alerts"
+
+# 2. Insert test events to resolve the alert (if Firing)
+MONGO_POD=$(kubectl get pod -n database -l app=mongo -o jsonpath='{.items[0].metadata.name}')
+kubectl exec -n database $MONGO_POD -- mongosh --eval '
+  db = db.getSiblingDB("commerce");
+  for (var i = 0; i < 10; i++) {
+    db.events.insertOne({
+      user_id: 99990 + i,
+      event_type: "alert_test",
+      ts: new Date(),
+      metadata: {test: "alert_lifecycle_test"}
+    });
+  }
+  print("Inserted 10 test events");
+'
+
+# 3. Wait ~60 seconds, then check — alert should resolve to Normal
+#    (alertmanager returns empty array)
+
+# 4. Stop inserting — after ~3 minutes of silence, alert re-enters Firing
+```
+
+This test was validated on 2026-02-27. See [Phase 7 — Alerts, SLOs & Observability](phase7-alerts-slos.md) for the full verification results.
+
+### Testing Alert 2 (Gold Layer Staleness)
+
+Alert 2 fires when the gold table hasn't been refreshed in over 25 hours. A full firing test requires waiting 25+ hours without running the Airflow DAG. Instead, validate the query directly:
+
+```bash
+# Check current gold table staleness
+kubectl exec -n database chi-chi-clickhouse-my-cluster-0-0-0 -- \
+  clickhouse-client --user default --password "" \
+  --query "SELECT dateDiff('hour', max(last_event_at), now()) AS staleness_hours FROM gold_user_activity FINAL"
+# If < 25, Alert 2 is Normal. If > 25, it will be Firing.
+```
+
+---
+
 ## 11. Common Operational Tasks
 
 ### Restart the Strimzi Operator (Fixes Stuck Reconciliation)
@@ -1386,7 +1471,14 @@ kubectl delete pod -n kafka my-connect-cluster-connect-0         # Restart Conne
 
 # == GRAFANA ==
 kubectl port-forward svc/grafana 3000:3000 -n monitoring             # Access Grafana
-# Open http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview  (admin / admin)
+# Dashboard: http://localhost:3000/d/cdc-pipeline-v1/cdc-pipeline-overview  (admin / admin)
+# Alerts:    http://localhost:3000/alerting/list
+
+# == GRAFANA ALERTS ==
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s http://admin:admin@localhost:3000/api/v1/provisioning/alert-rules  # List rules
+kubectl exec -n monitoring deployment/grafana -- \
+  curl -s "http://admin:admin@localhost:3000/api/alertmanager/grafana/api/v2/alerts"  # Firing alerts
 
 # == LOGS ==
 kubectl logs pod/my-connect-cluster-connect-0 -n kafka --tail=50    # Connect logs
