@@ -1,4 +1,4 @@
-# Barakah Data Engineering Challenge
+# Barakah CDC Platform
 
 ## Project Overview
 
